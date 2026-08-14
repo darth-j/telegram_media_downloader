@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from pathlib import Path
+from time import monotonic
 from typing import Optional, Set
 
 from telethon import TelegramClient, events
@@ -40,7 +40,7 @@ class _TelegramProgressReporter:
         self.last_update = 0.0
 
     async def __call__(self, current: int, total: int) -> None:
-        now = time.monotonic()
+        now = monotonic()
         completed = total > 0 and current >= total
         if not completed and now - self.last_update < self.interval:
             return

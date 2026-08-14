@@ -51,7 +51,7 @@ def test_progress_reporter_throttles_and_reports_completion(monkeypatch):
             edits.append(text)
 
     times = iter([10.0, 11.0, 14.0])
-    monkeypatch.setattr("bot_downloader.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("bot_downloader.monotonic", lambda: next(times))
     reporter = _TelegramProgressReporter(StatusMessage(), "video.mp4", interval=3.0)
 
     async def report_progress():
