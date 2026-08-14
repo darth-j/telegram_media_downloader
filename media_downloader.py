@@ -682,7 +682,8 @@ async def begin_import(  # pylint: disable=too-many-locals,too-many-branches,too
             "password": proxy.get("password"),
         }
     session_path = os.environ.get(
-        "TELEGRAM_SESSION", os.path.join(THIS_DIR, "sessions", "media_downloader")
+        "TELEGRAM_SESSION",
+        os.path.join(THIS_DIR, "sessions", "media_downloader_telethon"),
     )
     os.makedirs(os.path.dirname(os.path.abspath(session_path)), exist_ok=True)
     client = TelegramClient(
