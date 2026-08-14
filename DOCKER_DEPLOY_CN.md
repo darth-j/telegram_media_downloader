@@ -14,7 +14,7 @@ cp -R /旧项目/sessions/. sessions/
 cp -R /旧项目/downloads/. downloads/
 ```
 
-旧配置使用 `chat:`，新版使用 `chats:`。启动脚本会自动兼容并迁移该字段，同时保留 `api_id`、`api_hash`、`chat_id` 和 `last_read_message_id`，原配置备份会写入 `sessions/config-backups/`。旧版的 `data.yaml`、`file_path_prefix`、Web Bot 和 rclone 配置不属于上游新版功能，不会被导入。
+旧配置将聊天与重试状态放在 `data.yaml` 的 `chat:` 中，新版则使用 `config.yaml` 的 `chats:`。启动脚本会自动合并并迁移这些字段，同时保留 `api_id`、`api_hash`、proxy、`chat_id` 和重试状态，原配置备份会写入 `sessions/config-backups/`。旧版的 `file_path_prefix`、Web Bot 和 rclone 配置不属于上游新版功能，不会被导入。
 
 为确保下载落到挂载目录，请在 `config.yaml` 增加或修改：
 
