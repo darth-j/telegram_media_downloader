@@ -51,6 +51,11 @@ def _is_allowed(sender_id: Optional[int]) -> bool:
     return sender_id is not None and sender_id in _allowed_user_ids
 
 
+def _parse_command(raw_text: Optional[str]) -> str:
+    parts = (raw_text or "").strip().split(maxsplit=1)
+    return parts[0].split("@", 1)[0].lower() if parts else ""
+
+
 async def _resolve_allowed_users(client: TelegramClient, configured_users) -> Set[int]:
     resolved: Set[int] = set()
     for value in configured_users or []:
@@ -82,25 +87,23 @@ async def start_bot() -> None:
         api_hash=config["api_hash"],
         proxy=_proxy_from_config(config),
     )
-    await _bot_client.start(bot_token=bot_token)
-    _allowed_user_ids = await _resolve_allowed_users(
-        _bot_client, config.get("allowed_user_ids")
-    )
-    if not _allowed_user_ids:
-        await _bot_client.disconnect()
-        _bot_client = None
-        raise RuntimeError("bot_token is configured but allowed_user_ids is empty")
-
     download_root = config.get("download_directory") or os.path.join(
         THIS_DIR, "downloads"
     )
 
     @_bot_client.on(events.NewMessage(incoming=True))
     async def handle_message(event):
-        if not _is_allowed(event.sender_id):
+        authorised = _is_allowed(event.sender_id)
+        logger.info(
+            "Bot received message %s (authorised=%s, media=%s).",
+            event.message.id,
+            authorised,
+            bool(event.message.media),
+        )
+        if not authorised:
             return
         message = event.message
-        command = (message.raw_text or "").split(maxsplit=1)[0].split("@", 1)[0].lower()
+        command = _parse_command(message.raw_text)
         if command in {"/start", "/help"}:
             await event.respond(
                 "Telegram Media Downloader 已运行。\n\n"
@@ -128,6 +131,15 @@ async def start_bot() -> None:
         except Exception as error:  # pylint: disable=broad-except
             logger.exception("Bot media download failed for message %s", message.id)
             await event.respond(f"下载失败：{type(error).__name__}")
+
+    await _bot_client.start(bot_token=bot_token)
+    _allowed_user_ids = await _resolve_allowed_users(
+        _bot_client, config.get("allowed_user_ids")
+    )
+    if not _allowed_user_ids:
+        await _bot_client.disconnect()
+        _bot_client = None
+        raise RuntimeError("bot_token is configured but allowed_user_ids is empty")
 
     me = await _bot_client.get_me()
     logger.info(

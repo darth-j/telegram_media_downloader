@@ -273,7 +273,10 @@ def build_tour(current_page: dict, tab_panels, nav_items: list):
         ui.run_javascript("localStorage.setItem('tg_dl_tour_seen', '1')")
 
     async def check_first_visit():
-        result = await ui.run_javascript("localStorage.getItem('tg_dl_tour_seen')")
+        try:
+            result = await ui.run_javascript("localStorage.getItem('tg_dl_tour_seen')")
+        except TimeoutError:
+            return
         if not result:
             show_tour()
 
