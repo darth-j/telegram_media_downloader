@@ -232,6 +232,7 @@ async def _start_link_client(config: dict) -> Optional[TelegramClient]:
         "TELEGRAM_LINK_SESSION",
         os.path.join(THIS_DIR, "sessions", "media_downloader_link_telethon"),
     )
+    os.makedirs(os.path.dirname(os.path.abspath(session_path)), exist_ok=True)
     client = TelegramClient(
         session_path,
         api_id=config["api_id"],
