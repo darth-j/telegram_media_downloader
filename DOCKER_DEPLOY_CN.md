@@ -20,7 +20,7 @@ cp -R /旧项目/downloads/. downloads/
 
 ### Bot 自动下载
 
-配置 `bot_token` 和 `allowed_user_ids` 后，Bot 会和 Web UI 一起常驻运行。白名单用户直接发送或转发媒体给 Bot 即会下载到 `downloads/bot/<用户ID>/`。支持 `/help` 和 `/status`；未授权用户的消息会被忽略。Bot 使用 Token 自动登录，不需要手机验证码。
+配置 `bot_token` 和 `allowed_user_ids` 后，Bot 会和 Web UI 一起常驻运行。白名单用户直接发送、转发媒体或发送 Telegram 消息链接给 Bot，即会下载到 `downloads/bot/<用户ID>/`。直接媒体由 Bot 会话下载；Telegram 链接优先使用 `sessions/media_downloader_link_telethon.session` 用户会话，以访问该用户已加入的私有频道。支持 `/help` 和 `/status`；未授权用户的消息会被忽略。
 
 为确保下载落到挂载目录，请在 `config.yaml` 增加或修改：
 

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from time import monotonic
 from typing import Optional, Set
+from urllib.parse import urlparse
 
 from telethon import TelegramClient, events
+from telethon import utils as telethon_utils
 
 import db
 from config_manager import load_config
@@ -17,7 +20,12 @@ from media_downloader import get_media_type
 logger = logging.getLogger("bot_downloader")
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _bot_client: Optional[TelegramClient] = None
+_link_client: Optional[TelegramClient] = None
 _allowed_user_ids: Set[int] = set()
+_TELEGRAM_LINK_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/[^\s<>()]+",
+    re.IGNORECASE,
+)
 
 
 def _format_size(size: int) -> str:
@@ -95,6 +103,37 @@ def _parse_command(raw_text: Optional[str]) -> str:
     return parts[0].split("@", 1)[0].lower() if parts else ""
 
 
+def _telegram_message_links(raw_text: Optional[str]):
+    """Extract Telegram message targets as ``(entity, message_id)`` tuples."""
+    targets = []
+    seen = set()
+    for match in _TELEGRAM_LINK_PATTERN.finditer(raw_text or ""):
+        raw_url = match.group(0).rstrip(".,;:!?，。；：！？）]}")
+        parsed = urlparse(
+            raw_url
+            if raw_url.lower().startswith(("http://", "https://"))
+            else f"https://{raw_url}"
+        )
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts and parts[0].lower() == "s":
+            parts = parts[1:]
+        if len(parts) < 2 or not parts[-1].isdigit():
+            continue
+        if parts[0].lower() == "c":
+            if len(parts) < 3 or not parts[1].isdigit():
+                continue
+            entity = int(f"-100{parts[1]}")
+        elif parts[0].startswith(("+", "joinchat")):
+            continue
+        else:
+            entity = parts[0]
+        target = (entity, int(parts[-1]))
+        if target not in seen:
+            seen.add(target)
+            targets.append(target)
+    return targets
+
+
 async def _resolve_allowed_users(client: TelegramClient, configured_users) -> Set[int]:
     resolved: Set[int] = set()
     for value in configured_users or []:
@@ -106,9 +145,114 @@ async def _resolve_allowed_users(client: TelegramClient, configured_users) -> Se
     return resolved
 
 
+async def _download_message(
+    client: TelegramClient, event, message, download_root: str
+) -> bool:
+    """Download one media message, report progress, and record Web history."""
+    if not message or not message.media:
+        return False
+    destination = _target_path(download_root, int(event.sender_id), message)
+    status_message = await event.respond(f"开始下载：{destination.name}\n进度：0.0%")
+    progress = _TelegramProgressReporter(status_message, destination.name)
+    try:
+        saved_path = await client.download_media(
+            message,
+            file=str(destination),
+            progress_callback=progress,
+        )
+        size = os.path.getsize(saved_path) if saved_path else 0
+        absolute_path = os.path.abspath(saved_path) if saved_path else str(destination)
+        media_type = get_media_type(message) or "document"
+        db.record_download(
+            "Bot inbox",
+            message.id,
+            destination.name,
+            size,
+            absolute_path,
+            media_type,
+        )
+        await status_message.edit(
+            f"下载完成：{destination.name}\n"
+            f"进度：100.0%（{_format_size(size)}）\n"
+            "已写入 Web 下载历史。"
+        )
+        return True
+    except Exception as error:  # pylint: disable=broad-except
+        logger.exception("Bot media download failed for message %s", message.id)
+        await status_message.edit(f"下载失败：{type(error).__name__}")
+        return False
+
+
+async def _download_telegram_links(
+    client: TelegramClient, event, raw_text: Optional[str], download_root: str
+) -> bool:
+    """Resolve Telegram post links and download their media."""
+    targets = _telegram_message_links(raw_text)
+    if not targets:
+        return False
+    downloaded = False
+    for entity_ref, message_id in targets:
+        try:
+            entity = await _resolve_link_entity(client, entity_ref)
+            linked_message = await client.get_messages(entity, ids=message_id)
+            if not linked_message or not linked_message.media:
+                await event.respond("Telegram 链接中的消息不含媒体。")
+                continue
+            downloaded = (
+                await _download_message(client, event, linked_message, download_root)
+                or downloaded
+            )
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                "Unable to resolve Telegram message link: %s", type(error).__name__
+            )
+            await event.respond(
+                "无法访问该 Telegram 链接。公开频道链接可直接下载；"
+                "私有频道需要先将 Bot 加入并授予访问权限。"
+            )
+    return downloaded
+
+
+async def _resolve_link_entity(client: TelegramClient, entity_ref):
+    """Resolve a public username or locate a private channel in user dialogs."""
+    try:
+        return await client.get_entity(entity_ref)
+    except ValueError:
+        if not isinstance(entity_ref, int):
+            raise
+        async for dialog in client.iter_dialogs():
+            if telethon_utils.get_peer_id(dialog.entity) == entity_ref:
+                return dialog.entity
+        raise
+
+
+async def _start_link_client(config: dict) -> Optional[TelegramClient]:
+    """Connect the optional authorised user session used for Telegram links."""
+    session_path = os.environ.get(
+        "TELEGRAM_LINK_SESSION",
+        os.path.join(THIS_DIR, "sessions", "media_downloader_link_telethon"),
+    )
+    client = TelegramClient(
+        session_path,
+        api_id=config["api_id"],
+        api_hash=config["api_hash"],
+        proxy=_proxy_from_config(config),
+    )
+    await client.connect()
+    if await client.is_user_authorized():
+        logger.info("Telegram user session for message links is ready.")
+        return client
+    await client.disconnect()
+    logger.warning(
+        "Telegram user session for message links is not authorised; "
+        "only links accessible to the Bot can be resolved."
+    )
+    return None
+
+
 async def start_bot() -> None:
     """Start the optional bot listener inside the NiceGUI event loop."""
-    global _bot_client, _allowed_user_ids
+    global _bot_client, _link_client, _allowed_user_ids
     config = load_config()
     bot_token = config.get("bot_token")
     if not bot_token:
@@ -146,51 +290,27 @@ async def start_bot() -> None:
         if command in {"/start", "/help"}:
             await event.respond(
                 "Telegram Media Downloader 已运行。\n\n"
-                "直接发送或转发媒体文件给我，我会自动下载。\n"
+                "直接发送、转发媒体文件，或发送 Telegram 消息链接给我，"
+                "我会自动下载。\n"
                 "/status - 查看运行状态\n"
                 "/help - 查看帮助"
             )
             return
         if command == "/status":
-            await event.respond("Bot 在线，媒体自动下载已启用。")
+            link_status = "已启用" if _link_client else "仅限 Bot 可访问频道"
+            await event.respond(
+                "Bot 在线，媒体自动下载已启用。\n" f"Telegram 链接下载：{link_status}。"
+            )
             return
-        if not message.media:
+        if message.media:
+            await _download_message(_bot_client, event, message, download_root)
             return
-
-        destination = _target_path(download_root, int(event.sender_id), message)
-        status_message = await event.respond(
-            f"开始下载：{destination.name}\n进度：0.0%"
+        await _download_telegram_links(
+            _link_client or _bot_client, event, message.raw_text, download_root
         )
-        progress = _TelegramProgressReporter(status_message, destination.name)
-        try:
-            saved_path = await _bot_client.download_media(
-                message,
-                file=str(destination),
-                progress_callback=progress,
-            )
-            size = os.path.getsize(saved_path) if saved_path else 0
-            absolute_path = (
-                os.path.abspath(saved_path) if saved_path else str(destination)
-            )
-            media_type = get_media_type(message) or "document"
-            db.record_download(
-                "Bot inbox",
-                message.id,
-                destination.name,
-                size,
-                absolute_path,
-                media_type,
-            )
-            await status_message.edit(
-                f"下载完成：{destination.name}\n"
-                f"进度：100.0%（{_format_size(size)}）\n"
-                "已写入 Web 下载历史。"
-            )
-        except Exception as error:  # pylint: disable=broad-except
-            logger.exception("Bot media download failed for message %s", message.id)
-            await status_message.edit(f"下载失败：{type(error).__name__}")
 
     await _bot_client.start(bot_token=bot_token)
+    _link_client = await _start_link_client(config)
     _allowed_user_ids = await _resolve_allowed_users(
         _bot_client, config.get("allowed_user_ids")
     )
@@ -209,7 +329,10 @@ async def start_bot() -> None:
 
 async def stop_bot() -> None:
     """Disconnect the optional bot client during application shutdown."""
-    global _bot_client
+    global _bot_client, _link_client
+    if _link_client and _link_client.is_connected():
+        await _link_client.disconnect()
+    _link_client = None
     if _bot_client and _bot_client.is_connected():
         await _bot_client.disconnect()
     _bot_client = None
