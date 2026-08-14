@@ -7,10 +7,10 @@ import pytest
 pytest.importorskip("telethon")
 
 from bot_downloader import (  # noqa: E402
-    _TelegramProgressReporter,
     _format_size,
     _parse_command,
     _target_path,
+    _TelegramProgressReporter,
 )
 
 
