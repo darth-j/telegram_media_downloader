@@ -17,6 +17,7 @@ except ImportError:
     print("  pip install -r requirements-webui.txt\n")
     sys.exit(1)
 
+from bot_downloader import start_bot, stop_bot
 from config_manager import load_config, save_config
 from webui.config_tab import build_config_tab
 from webui.execution_tab import build_execution_tab
@@ -26,6 +27,9 @@ from webui.tour import build_tour
 
 logger = logging.getLogger("webui")
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+app.on_startup(start_bot)
+app.on_shutdown(stop_bot)
 
 
 @ui.page("/")

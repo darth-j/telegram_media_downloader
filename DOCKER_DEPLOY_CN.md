@@ -18,6 +18,10 @@ cp -R /旧项目/downloads/. downloads/
 
 旧版 Pyrogram 与新版 Telethon 的 session 数据库格式不兼容。新版使用独立的 `sessions/media_downloader_telethon.session`，不会覆盖旧 session；首次执行下载时需要完成一次 Telegram 验证码登录。
 
+### Bot 自动下载
+
+配置 `bot_token` 和 `allowed_user_ids` 后，Bot 会和 Web UI 一起常驻运行。白名单用户直接发送或转发媒体给 Bot 即会下载到 `downloads/bot/<用户ID>/`。支持 `/help` 和 `/status`；未授权用户的消息会被忽略。Bot 使用 Token 自动登录，不需要手机验证码。
+
 为确保下载落到挂载目录，请在 `config.yaml` 增加或修改：
 
 ```yaml

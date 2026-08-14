@@ -31,3 +31,4 @@ services:
       NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
       CONFIG_BACKUP_DIR: /app/sessions/config-backups
       TELEGRAM_SESSION: /app/sessions/media_downloader_telethon
+      TELEGRAM_BOT_SESSION: /app/sessions/media_downloader_bot_telethon

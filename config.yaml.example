@@ -1,6 +1,10 @@
 api_hash: your_api_hash
 api_id: your_api_id
 
+# Optional Telegram Bot: authorised users can send/forward media for auto-download.
+bot_token: null
+allowed_user_ids: []
+
 # The downloader can process multiple chats (either sequentially or in parallel).
 # The 'chats' list is highly customizable per chat. If an option is not provided
 # in a chat dictionary, it will fall back to the global option defined above.
