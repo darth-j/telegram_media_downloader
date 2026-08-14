@@ -22,6 +22,7 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _bot_client: Optional[TelegramClient] = None
 _link_client: Optional[TelegramClient] = None
 _allowed_user_ids: Set[int] = set()
+_task_id = 0
 _TELEGRAM_LINK_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/[^\s<>()]+",
     re.IGNORECASE,
@@ -38,30 +39,124 @@ def _format_size(size: int) -> str:
     return f"{value:.1f} TB"
 
 
-class _TelegramProgressReporter:
-    """Throttle progress edits to avoid Telegram flood limits."""
+def _format_legacy_size(size: float) -> str:
+    """Format bytes like the original tangyoha Bot status card."""
+    value = max(0.0, float(size))
+    if value < 1:
+        return f"{round(value / 0.125, 2)}b"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{round(value, 2)}{unit}"
+        value /= 1024
+    return f"{round(value, 2)}TB"
 
-    def __init__(self, status_message, file_name: str, interval: float = 3.0):
+
+def _progress_bar(percent: float, width: int = 10) -> str:
+    completed = max(0, min(width, int(percent * width / 100)))
+    return "█" * completed + "░" * (width - completed)
+
+
+def _next_task_id() -> int:
+    global _task_id
+    _task_id += 1
+    return _task_id
+
+
+def _task_status_text(
+    task_id: int,
+    downloaded: int,
+    total_tasks: int = 0,
+    success: int = 0,
+    failed: int = 0,
+    skipped: int = 0,
+    message_id: Optional[int] = None,
+    file_name: Optional[str] = None,
+    total_size: int = 0,
+    speed: float = 0,
+) -> str:
+    """Build a task card compatible with the original tangyoha Bot."""
+    text = (
+        f"🆔 task id: {task_id}\n"
+        f"📥 Downloading: {_format_legacy_size(downloaded)}\n"
+        f"├─ 📁 Total: {total_tasks}\n"
+        f"├─ ✅ Success: {success}\n"
+        f"├─ ❌ Failed: {failed}\n"
+        f"└─ ⏩ Skipped: {skipped}"
+    )
+    if message_id is None or not file_name or total_size <= 0 or total_tasks:
+        return text
+    percent = min(100.0, downloaded * 100 / total_size)
+    display_name = file_name if len(file_name) <= 28 else f"{file_name[:25]}..."
+    return (
+        f"{text}\n\n"
+        "📥 Download Progresses:\n"
+        f" ├─ 🆔 Message ID: {message_id}\n"
+        f" │   ├─ 📁 : {display_name}\n"
+        f" │   ├─ 📏 : {_format_legacy_size(total_size)}\n"
+        f" │   ├─ ⏬ : {_format_legacy_size(speed)}/s\n"
+        f" │   └─ 📊 : [{_progress_bar(percent)}] ({percent:.1f}%)"
+    )
+
+
+class _TelegramProgressReporter:
+    """Render the original tangyoha-style task card with throttled edits."""
+
+    def __init__(
+        self,
+        status_message,
+        file_name: str,
+        task_id: int,
+        message_id: int,
+        interval: float = 1.0,
+    ):
         self.status_message = status_message
         self.file_name = file_name
+        self.task_id = task_id
+        self.message_id = message_id
         self.interval = interval
         self.last_update = 0.0
+        self.last_current = 0
+        self.current = 0
 
     async def __call__(self, current: int, total: int) -> None:
         now = monotonic()
         completed = total > 0 and current >= total
         if not completed and now - self.last_update < self.interval:
             return
+        elapsed = max(now - self.last_update, 0.001) if self.last_update else 0
+        speed = (current - self.last_current) / elapsed if elapsed else 0
         self.last_update = now
-        percent = min(100.0, current * 100 / total) if total > 0 else 0.0
-        total_text = _format_size(total) if total > 0 else "未知"
+        self.last_current = current
+        self.current = current
         try:
             await self.status_message.edit(
-                f"正在下载：{self.file_name}\n"
-                f"进度：{percent:.1f}%（{_format_size(current)} / {total_text}）"
+                _task_status_text(
+                    self.task_id,
+                    current,
+                    message_id=self.message_id,
+                    file_name=self.file_name,
+                    total_size=total,
+                    speed=speed,
+                )
             )
         except Exception as error:  # pylint: disable=broad-except
             logger.debug("Unable to update Bot download progress: %s", error)
+
+    async def finish(self, success: bool, size: int, suffix: str = "") -> None:
+        """Finish the task card with final counters."""
+        text = _task_status_text(
+            self.task_id,
+            size,
+            total_tasks=1,
+            success=1 if success else 0,
+            failed=0 if success else 1,
+        )
+        if suffix:
+            text = f"{text}\n\n{suffix}"
+        try:
+            await self.status_message.edit(text)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.debug("Unable to finish Bot download progress: %s", error)
 
 
 def _proxy_from_config(config: dict):
@@ -152,8 +247,11 @@ async def _download_message(
     if not message or not message.media:
         return False
     destination = _target_path(download_root, int(event.sender_id), message)
-    status_message = await event.respond(f"开始下载：{destination.name}\n进度：0.0%")
-    progress = _TelegramProgressReporter(status_message, destination.name)
+    task_id = _next_task_id()
+    status_message = await event.respond(_task_status_text(task_id, 0))
+    progress = _TelegramProgressReporter(
+        status_message, destination.name, task_id, message.id
+    )
     try:
         saved_path = await client.download_media(
             message,
@@ -171,15 +269,17 @@ async def _download_message(
             absolute_path,
             media_type,
         )
-        await status_message.edit(
-            f"下载完成：{destination.name}\n"
-            f"进度：100.0%（{_format_size(size)}）\n"
-            "已写入 Web 下载历史。"
+        await progress.finish(
+            True,
+            size,
+            f"✅ 下载完成：{destination.name}\n已写入 Web 下载历史。",
         )
         return True
     except Exception as error:  # pylint: disable=broad-except
         logger.exception("Bot media download failed for message %s", message.id)
-        await status_message.edit(f"下载失败：{type(error).__name__}")
+        await progress.finish(
+            False, progress.current, f"❌ 下载失败：{type(error).__name__}"
+        )
         return False
 
 

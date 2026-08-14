@@ -9,10 +9,12 @@ pytest.importorskip("telethon")
 
 from bot_downloader import (  # noqa: E402
     _download_telegram_links,
+    _format_legacy_size,
     _format_size,
     _parse_command,
     _resolve_link_entity,
     _target_path,
+    _task_status_text,
     _telegram_message_links,
     _TelegramProgressReporter,
 )
@@ -118,6 +120,18 @@ def test_format_size(size, expected):
     assert _format_size(size) == expected
 
 
+def test_original_tangyoha_task_card_format():
+    assert _format_legacy_size(0) == "0.0b"
+    assert _task_status_text(51, 0) == (
+        "🆔 task id: 51\n"
+        "📥 Downloading: 0.0b\n"
+        "├─ 📁 Total: 0\n"
+        "├─ ✅ Success: 0\n"
+        "├─ ❌ Failed: 0\n"
+        "└─ ⏩ Skipped: 0"
+    )
+
+
 def test_progress_reporter_throttles_and_reports_completion(monkeypatch):
     edits = []
 
@@ -127,12 +141,15 @@ def test_progress_reporter_throttles_and_reports_completion(monkeypatch):
 
     times = iter([10.0, 11.0, 14.0])
     monkeypatch.setattr("bot_downloader.monotonic", lambda: next(times))
-    reporter = _TelegramProgressReporter(StatusMessage(), "video.mp4", interval=3.0)
+    reporter = _TelegramProgressReporter(
+        StatusMessage(), "video.mp4", task_id=51, message_id=42, interval=3.0
+    )
 
     async def report_progress():
         await reporter(10, 100)
         await reporter(20, 100)
         await reporter(100, 100)
+        await reporter.finish(True, 100, "done")
 
     try:
         loop = asyncio.get_event_loop()
@@ -141,6 +158,11 @@ def test_progress_reporter_throttles_and_reports_completion(monkeypatch):
         asyncio.set_event_loop(loop)
     loop.run_until_complete(report_progress())
 
-    assert len(edits) == 2
+    assert len(edits) == 3
+    assert "🆔 task id: 51" in edits[0]
+    assert "Message ID: 42" in edits[0]
     assert "10.0%" in edits[0]
     assert "100.0%" in edits[1]
+    assert "Total: 1" in edits[2]
+    assert "Success: 1" in edits[2]
+    assert edits[2].endswith("done")
