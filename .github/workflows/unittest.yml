@@ -29,7 +29,9 @@ jobs:
     - name: Upgrade packaging tools
       run: python -m pip install --upgrade pip setuptools
     - name: Install dependencies
-      run: make dev_install
+      run: |
+        make dev_install
+        make install_webui
     - name: Setup test configuration
       run: cp config.yaml.example config.yaml
     - name: Test with pytest
