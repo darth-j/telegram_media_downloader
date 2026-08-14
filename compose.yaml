@@ -1,0 +1,32 @@
+services:
+  telegram-media-downloader:
+    build:
+      context: .
+    image: ${DOCKER_IMAGE:-telegram-media-downloader:latest}
+    container_name: telegram-media-downloader
+    restart: unless-stopped
+    ports:
+      - "${WEBUI_PORT:-5000}:8080"
+    volumes:
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./downloads
+        target: /app/downloads
+      - type: bind
+        source: ./sessions
+        target: /app/sessions
+      - type: bind
+        source: ./downloads.sqlite3
+        target: /app/downloads.sqlite3
+        bind:
+          create_host_path: false
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+      CONFIG_BACKUP_DIR: /app/sessions/config-backups

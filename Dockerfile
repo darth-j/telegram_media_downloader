@@ -1,25 +1,21 @@
-FROM python:3.11.9-alpine As compile-image
+FROM python:3.13-slim-bookworm AS builder
 
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt requirements-webui.txt ./
+RUN python -m venv /opt/venv && /opt/venv/bin/pip install --upgrade pip && /opt/venv/bin/pip install -r requirements.txt -r requirements-webui.txt
 
-COPY requirements.txt /app/
-
-RUN apk add --no-cache --virtual .build-deps gcc musl-dev \
-    && pip install --trusted-host pypi.python.org -r requirements.txt \
-    && apk del .build-deps && rm -rf requirements.txt
-
-RUN apk add --no-cache rclone
-
-FROM python:3.11.9-alpine As runtime-image
-
+FROM python:3.13-slim-bookworm AS runtime
+ENV PATH="/opt/venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
-
-COPY --from=tangyoha/telegram_media_downloader_compile:latest /usr/bin/rclone /app/rclone/rclone
-
-COPY --from=tangyoha/telegram_media_downloader_compile:latest /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-
-COPY config.yaml data.yaml setup.py media_downloader.py /app/
-COPY module /app/module
-COPY utils /app/utils
-
-CMD ["python", "media_downloader.py"]
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 app && useradd --uid 1000 --gid app --create-home app
+COPY --from=builder /opt/venv /opt/venv
+COPY --chown=app:app . /app
+RUN chmod +x /app/docker-entrypoint.sh && mkdir -p /app/downloads /app/sessions && chown -R app:app /app/downloads /app/sessions
+USER app
+EXPOSE 8080
+VOLUME ["/app/downloads", "/app/sessions"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["webui"]

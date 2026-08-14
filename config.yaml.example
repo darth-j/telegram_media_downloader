@@ -1,0 +1,62 @@
+api_hash: your_api_hash
+api_id: your_api_id
+
+# The downloader can process multiple chats (either sequentially or in parallel).
+# The 'chats' list is highly customizable per chat. If an option is not provided
+# in a chat dictionary, it will fall back to the global option defined above.
+parallel_chats: false
+
+chats:
+  - chat_id: telegram_chat_id
+    last_read_message_id: 0
+    ids_to_retry: []
+    # (Optional) You can override global settings per-chat:
+    # download_directory: /custom/path/for/this/chat
+    # media_types:
+    # - photo
+    # - video
+    # file_formats:
+    #   video:
+    #   - mp4
+    # start_date: 2025-01-01T00:00:00+00:00
+    # end_date: 2025-12-31T23:59:59+00:00
+    # max_messages: 100
+  # - chat_id: another_telegram_chat_id
+  #   last_read_message_id: 0
+  #   ids_to_retry: []
+
+# GLOBAL SETTINGS (These act as fallbacks for the chats defined above)
+# For backwards compatibility, a single chat_id here still works.
+chat_id: telegram_chat_id
+last_read_message_id: 0
+ids_to_retry: []
+
+media_types:
+- audio
+- photo
+- video
+- document
+- voice
+- video_note
+file_formats:
+  audio:
+  - all
+  document:
+  - all
+  video:
+  - all
+
+#optional
+download_directory: null  # Custom directory path for downloads (absolute or relative)
+start_date: null
+end_date: null
+max_messages: null
+
+# Download Pacing / Rate Limiting (optional, can also be set per-chat)
+# Max number of files downloading simultaneously within each batch.
+# Lower values = slower but safer.  1 = fully sequential.  Default: 4
+max_concurrent_downloads: 4
+# Pause between starting each file download.
+# Fixed delay:  download_delay: 2        (always 2 seconds)
+# Random range: download_delay: [1, 5]   (random 1–5 seconds per file)
+download_delay: null

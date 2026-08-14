@@ -9,6 +9,7 @@
 .mypy_cache/
 .coverage
 settings.json
+coverage.xml
 
 # Distribution / packaging
 .Python
@@ -59,14 +60,9 @@ photo/
 voice/
 video/
 video_note/
-parser.out
-parsetab.py
-local_test/
-.vscode
-TODO.md
-log/
-temp/
+
+# Config file
 config.yaml
-data.yaml
-*.scss
-*.css.map
+
+# Database
+downloads.sqlite3

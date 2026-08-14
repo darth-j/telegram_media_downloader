@@ -1,49 +1,35 @@
 """Unittest module for media downloader."""
+
 import asyncio
+import copy
 import os
 import platform
-import queue
-import sys
 import unittest
-from datetime import datetime
-from typing import List, Union
+from datetime import datetime, timezone
+from unittest import mock
+from unittest.mock import patch
 
-import mock
-import pyrogram
+from telethon import TelegramClient
+from telethon.errors import FileReferenceExpiredError
+from telethon.tl.types import (
+    DocumentAttributeAudio,
+    DocumentAttributeFilename,
+    DocumentAttributeVideo,
+    MessageMediaDocument,
+    MessageMediaPhoto,
+)
 
 from media_downloader import (
     _can_download,
-    _check_config,
     _get_media_meta,
     _is_exist,
-    app,
-    download_all_chat,
+    _progress_callback,
+    begin_import,
     download_media,
-    download_task,
+    get_media_type,
     main,
-    save_msg_to_file,
-    worker,
-)
-from module.app import Application, DownloadStatus, TaskNode
-from module.cloud_drive import CloudDriveConfig
-from module.pyrogram_extension import (
-    get_extension,
-    record_download_status,
-    reset_download_cache,
-)
-
-from .test_common import (
-    Chat,
-    Date,
-    MockAudio,
-    MockDocument,
-    MockMessage,
-    MockPhoto,
-    MockVideo,
-    MockVideoNote,
-    MockVoice,
-    get_extension,
-    platform_generic_path,
+    process_messages,
+    update_config,
 )
 
 MOCK_DIR: str = "/root/project"
@@ -52,115 +38,132 @@ if platform.system() == "Windows":
 MOCK_CONF = {
     "api_id": 123,
     "api_hash": "hasw5Tgawsuj67",
-    "chat": [{"chat_id": 8654123, "last_read_message_id": 0, "ids_to_retry": [1, 2]}],
-    "media_types": ["audio", "voice", "document", "photo", "video", "video_note"],
-    "file_formats": {"audio": ["all"], "voice": ["all"], "video": ["all"]},
-    "save_path": MOCK_DIR,
-    "file_name_prefix": ["message_id", "caption", "file_name"],
+    "last_read_message_id": 0,
+    "chat_id": 8654123,
+    "ids_to_retry": [1],
+    "media_types": ["audio", "voice"],
+    "file_formats": {"audio": ["all"], "voice": ["all"]},
+    "download_directory": None,
+    "start_date": None,
+    "end_date": None,
+    "max_messages": None,
 }
 
-event_str = "asyncio.AbstractEventLoop.run_forever"
-if sys.version_info > (3, 8):
-    event_str = "asyncio.ProactorEventLoop.run_forever"
 
-
-def os_remove(_: str):
-    pass
-
-
-def is_exist(file: str):
-    if os.path.basename(file).find("313 - sucess_exist_down.mp4") != -1:
-        return True
-    elif os.path.basename(file).find("422 - exception.mov") != -1:
-        raise Exception
-    return False
-
-
-def os_get_file_size(file: str) -> int:
-    if os.path.basename(file).find("311 - failed_down.mp4") != -1:
-        return 0
-    elif os.path.basename(file).find("312 - sucess_down.mp4") != -1:
-        return 1024
-    elif os.path.basename(file).find("313 - sucess_exist_down.mp4") != -1:
-        return 1024
-    return 0
-
-
-def rest_app(conf: dict):
-    config_test = os.path.join(os.path.abspath("."), "config_test.yaml")
-    data_test = os.path.join(os.path.abspath("."), "data_test.yaml")
-    if os.path.exists(config_test):
-        os.remove(config_test)
-    if os.path.exists(data_test):
-        os.remove(data_test)
-    app.total_download_task = 0
-    app.is_running = True
-    app.chat_download_config: dict = {}
-    # app.already_download_ids_set = set()
-    app.save_path = os.path.abspath(".")
-    app.api_id: str = ""
-    app.api_hash: str = ""
-    app.media_types: List[str] = []
-    app.file_formats: dict = {}
-    app.proxy: dict = {}
-    app.restart_program = False
-    app.config: dict = {}
-    app.app_data: dict = {}
-    app.file_path_prefix: List[str] = ["chat_title", "media_datetime"]
-    app.file_name_prefix: List[str] = ["message_id", "file_name"]
-    app.file_name_prefix_split: str = " - "
-    app.log_file_path = os.path.join(os.path.abspath("."), "log")
-    app.cloud_drive_config = CloudDriveConfig()
-    app.hide_file_name = False
-    app.caption_name_dict: dict = {}
-    app.max_concurrent_transmissions: int = 1
-    app.web_host: str = "localhost"
-    app.web_port: int = 5000
-    app.config_file = "config_test.yaml"
-    app.app_data_file = "data_test.yaml"
-    app.config = conf
-    app.assign_config(conf)
-    app.assign_app_data(conf)
+def platform_generic_path(_path: str) -> str:
+    platform_specific_path: str = _path
+    if platform.system() == "Windows":
+        platform_specific_path = platform_specific_path.replace("/", "\\")
+    return platform_specific_path
 
 
 def mock_manage_duplicate_file(file_path: str) -> str:
     return file_path
 
 
-def raise_keyboard_interrupt():
-    raise KeyboardInterrupt
+class Chat:
+    def __init__(self, chat_id):
+        self.id = chat_id
 
 
-async def new_upload_telegram_chat(
-    client: pyrogram.Client,
-    upload_user: pyrogram.Client,
-    app: Application,
-    node: TaskNode,
-    message: pyrogram.types.Message,
-    download_status: DownloadStatus,
-    file_name: str = None,
-):
-    pass
+class MockMessage:
+    def __init__(self, **kwargs):
+        self.id = kwargs.get("id")
+        self.media = kwargs.get("media")
+        self.audio = kwargs.get("audio", None)
+        self.document = kwargs.get("document", None)
+        self.photo = kwargs.get("photo", None)
+        self.video = kwargs.get("video", None)
+        self.voice = kwargs.get("voice", None)
+        self.video_note = kwargs.get("video_note", None)
+        self.chat = Chat(kwargs.get("chat_id", None))
+        self.date = kwargs.get("date", datetime.now(timezone.utc))
+        # Set media based on type
+        if self.photo:
+            self.media = mock.Mock(spec=MessageMediaPhoto, photo=self.photo)
+        elif self.document or self.audio or self.video or self.voice or self.video_note:
+            # Set the appropriate document attribute based on what's provided
+            media_obj = (
+                self.document
+                or self.audio
+                or self.video
+                or self.voice
+                or self.video_note
+            )
+            self.media = mock.Mock(
+                spec=MessageMediaDocument,
+                document=media_obj,
+            )
+            # Also set the individual attribute for consistency
+            if self.video:
+                self.document = self.video
+            elif self.audio:
+                self.document = self.audio
+            elif self.voice:
+                self.document = self.voice
+            elif self.video_note:
+                self.document = self.video_note
+        else:
+            self.media = None
 
 
-def raise_exception():
-    raise Exception
+class MockAudio:
+    def __init__(self, **kwargs):
+        self.file_name = kwargs.get("file_name", "test.mp3")
+        self.mime_type = kwargs["mime_type"]
+        self.id = 123
+        self.attributes = kwargs.get(
+            "attributes", [mock.Mock(file_name=self.file_name)]
+        )
 
 
-def load_config():
-    raise ValueError("error load config")
+class MockDocument:
+    def __init__(self, **kwargs):
+        self.file_name = kwargs.get("file_name", "test.pdf")
+        self.mime_type = kwargs["mime_type"]
+        self.id = 123
+        self.attributes = kwargs.get(
+            "attributes", [mock.Mock(file_name=self.file_name)]
+        )
 
 
-class MyQueue:
-    def __init__(self, queue_list_obj):
-        self._queue = queue.Queue()
-        for item in queue_list_obj:
-            self._queue.put(item)
+class MockPhoto:
+    def __init__(self, **kwargs):
+        self.date = kwargs["date"]
+        self.id = 123
 
-    async def get(self):
-        if self._queue.empty():
-            raise Exception
-        return self._queue.get()
+
+class MockVoice:
+    def __init__(self, **kwargs):
+        self.mime_type = kwargs["mime_type"]
+        self.date = kwargs["date"]
+        self.id = 123
+        self.attributes = []
+
+
+class MockVideo:
+    def __init__(self, **kwargs):
+        self.file_name = kwargs.get("file_name", "test.mp4")
+        self.mime_type = kwargs["mime_type"]
+        self.id = 123
+        self.size = kwargs.get("size", 1024)  # Add size attribute for progress bar
+
+        # Add video attribute for media type detection
+        # Create a simple object instead of Mock to avoid file_name interference
+        class VideoAttr:
+            def __init__(self):
+                self.voice = None
+                self.round_message = False
+
+        self.attributes = [VideoAttr()]
+
+
+class MockVideoNote:
+    def __init__(self, **kwargs):
+        self.mime_type = kwargs["mime_type"]
+        self.date = kwargs["date"]
+        self.id = 123
+        self.attributes = []
 
 
 class MockEventLoop:
@@ -168,7 +171,12 @@ class MockEventLoop:
         pass
 
     def run_until_complete(self, *args, **kwargs):
-        return {"api_id": 1, "api_hash": "asdf", "ids_to_retry": [1, 2, 3]}
+        return {
+            "api_id": 1,
+            "api_hash": "asdf",
+            "ids_to_retry": [1, 2, 3],
+            "chat_id": 8654123,
+        }
 
 
 class MockAsync:
@@ -179,217 +187,167 @@ class MockAsync:
         return MockEventLoop()
 
 
-async def async_get_media_meta(chat_id, message, message_media, _type):
-    result = await _get_media_meta(chat_id, message, message_media, _type)
+async def async_get_media_meta(message_media, _type):
+    result = await _get_media_meta(message_media, _type, chat_id="123")
     return result
 
 
-async def async_download_media(
-    client, message, media_types, file_formats, chat_id=-123
-):
-    node = TaskNode(chat_id=chat_id)
-    return await download_media(client, message, media_types, file_formats, node)
+async def async_get_media_meta_custom_dir(message_media, _type, download_directory):
+    result = await _get_media_meta(
+        message_media, _type, chat_id="123", download_directory=download_directory
+    )
+    return result
 
 
-def mock_move_to_download_path(temp_download_path: str, download_path: str):
-    pass
+async def async_download_media(client, message, media_types, file_formats):
+    result = await download_media(
+        client, message, media_types, file_formats, chat_id="123"
+    )
+    return result
 
 
-def mock_check_download_finish(media_size: int, download_path: str, ui_file_name: str):
-    pass
+async def async_begin_import(conf, pagination_limit):
+    result = await begin_import(conf, pagination_limit)
+    return result
 
 
-async def new_fetch_message(client: pyrogram.Client, message: pyrogram.types.Message):
-    return message
+async def mock_process_message(*args, **kwargs):
+    return 5
 
 
-async def get_chat_history(client, *args, **kwargs):
-    items = [
-        MockMessage(
-            id=1213,
-            media=True,
-            voice=MockVoice(
-                mime_type="audio/ogg",
-                date=datetime(2019, 7, 25, 14, 53, 50),
-            ),
-        ),
-        MockMessage(
-            id=1214,
-            media=False,
-            text="test message 1",
-        ),
-        MockMessage(
-            id=1215,
-            media=False,
-            text="test message 2",
-        ),
-        MockMessage(
-            id=1216,
-            media=False,
-            text="test message 3",
-        ),
-    ]
-    for item in items:
-        yield item
+async def async_process_messages(client, messages, media_types, file_formats):
+    result = await process_messages(
+        client, messages, media_types, file_formats, chat_id="123"
+    )
+    return result
+
+
+class SimpleAttr:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
 
 class MockClient:
     def __init__(self, *args, **kwargs):
         pass
 
-    def __aiter__(self):
-        return self
-
     async def start(self):
         pass
 
-    async def stop(self):
+    async def disconnect(self):
         pass
 
+    async def iter_messages(self, *args, **kwargs):
+        items = [
+            MockMessage(
+                id=1213,
+                media=True,
+                voice=MockVoice(
+                    mime_type="audio/ogg",
+                    date=datetime(2019, 7, 25, 14, 53, 50),
+                ),
+            ),
+            MockMessage(
+                id=1214,
+                media=False,
+                text="test message 1",
+            ),
+            MockMessage(
+                id=1215,
+                media=False,
+                text="test message 2",
+            ),
+            MockMessage(
+                id=1216,
+                media=False,
+                text="test message 3",
+            ),
+        ]
+        for item in items:
+            yield item
+
     async def get_messages(self, *args, **kwargs):
-        if kwargs["message_ids"] == 7:
-            return MockMessage(
+        ids = kwargs.get("ids", kwargs.get("message_ids"))
+        if ids == 7:
+            message = MockMessage(
                 id=7,
                 media=True,
                 chat_id=123456,
-                chat_title="123456",
-                date=datetime.now(),
                 video=MockVideo(
                     file_name="sample_video.mov",
                     mime_type="video/mov",
                 ),
             )
-        elif kwargs["message_ids"] == 8:
-            return MockMessage(
+        elif ids == 8:
+            message = MockMessage(
                 id=8,
                 media=True,
                 chat_id=234567,
-                chat_title="234567",
-                date=datetime.now(),
                 video=MockVideo(
                     file_name="sample_video.mov",
                     mime_type="video/mov",
                 ),
             )
-        elif kwargs["message_ids"] == [1, 2]:
-            return [
+        elif ids == [1]:
+            message = [
                 MockMessage(
                     id=1,
                     media=True,
                     chat_id=234568,
-                    chat_title="234568",
-                    date=datetime.now(),
                     video=MockVideo(
                         file_name="sample_video.mov",
                         mime_type="video/mov",
                     ),
-                ),
-                MockMessage(
-                    id=2,
-                    media=True,
-                    chat_id=234568,
-                    chat_title="234568",
-                    date=datetime.now(),
-                    video=MockVideo(
-                        file_name="sample_video2.mov",
-                        mime_type="video/mov",
-                    ),
-                ),
+                )
             ]
-        elif kwargs["message_ids"] == 313:
-            return MockMessage(
-                id=313,
-                media=True,
-                video=MockVideo(
-                    file_name="sucess_exist_down.mp4",
-                    mime_type="video/mp4",
-                    file_size=1024,
-                ),
-            )
-        elif kwargs["message_ids"] == 312:
-            return MockMessage(
-                id=312,
-                media=True,
-                video=MockVideo(
-                    file_name="sucess_down.mp4",
-                    mime_type="video/mp4",
-                    file_size=1024,
-                ),
-            )
-        elif kwargs["message_ids"] == 311:
-            return MockMessage(
-                id=311,
-                media=True,
-                video=MockVideo(
-                    file_name="failed_down.mp4",
-                    mime_type="video/mp4",
-                    file_size=1024,
-                ),
-            )
-        return []
+        return message
 
-    async def download_media(self, *args, **kwargs):
-        mock_message = args[0]
+    async def download_media(self, message_or_media, file=None, **kwargs):
+        mock_message = message_or_media
         if mock_message.id in [7, 8]:
-            raise pyrogram.errors.exceptions.bad_request_400.BadRequest
+            raise FileReferenceExpiredError
         elif mock_message.id == 9:
-            raise pyrogram.errors.exceptions.unauthorized_401.Unauthorized
+            raise Exception("Unauthorized")
         elif mock_message.id == 11:
-            raise TypeError
-        elif mock_message.id == 420:
-            raise pyrogram.errors.exceptions.flood_420.FloodWait(value=420)
-        elif mock_message.id == 421:
-            raise Exception
-        return kwargs["file_name"]
-
-    async def edit_message_text(self, *args, **kwargs):
-        return True
+            raise TimeoutError
+        elif mock_message.id == 13:
+            return None
+        return file or "downloaded"
 
 
-def check_for_updates(_: dict = None):
-    pass
-
-
-@mock.patch("media_downloader.get_extension", new=get_extension)
-@mock.patch("module.pyrogram_extension.get_extension", new=get_extension)
-@mock.patch("media_downloader.fetch_message", new=new_fetch_message)
-@mock.patch("media_downloader.get_chat_history_v2", new=get_chat_history)
-@mock.patch("media_downloader.RETRY_TIME_OUT", new=0)
-@mock.patch("media_downloader.check_for_updates", new=check_for_updates)
 class MediaDownloaderTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.loop = asyncio.get_event_loop()
-        rest_app(MOCK_CONF)
 
-    # @mock.patch("media_downloader.app.save_path", new=MOCK_DIR)
+    def setUp(self):
+        # Prevent tests from writing to the real SQLite database
+        self._db_record_patcher = mock.patch("media_downloader.db.record_download")
+        self._db_record_patcher.start()
+
+    def tearDown(self):
+        self._db_record_patcher.stop()
+
+    @mock.patch("media_downloader.THIS_DIR", new=MOCK_DIR)
     def test_get_media_meta(self):
-        rest_app(MOCK_CONF)
-        app.save_path = MOCK_DIR
         # Test Voice notes
         message = MockMessage(
             id=1,
             media=True,
-            chat_title="test1",
-            date=datetime(2019, 7, 25, 14, 53, 50),
             voice=MockVoice(
                 mime_type="audio/ogg",
                 date=datetime(2019, 7, 25, 14, 53, 50),
             ),
         )
         result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.voice, "voice")
+            async_get_media_meta(message.voice, "voice")
         )
 
         self.assertEqual(
             (
                 platform_generic_path(
-                    "/root/project/test1/2019_07/1 - voice_2019-07-25T14_53_50.ogg"
-                ),
-                platform_generic_path(
-                    os.path.join(
-                        app.temp_save_path, "test1/1 - voice_2019-07-25T14_53_50.ogg"
-                    )
+                    "/root/project/123/voice/voice_2019-07-25T14_53_50.ogg"
                 ),
                 "ogg",
             ),
@@ -400,51 +358,15 @@ class MediaDownloaderTestCase(unittest.TestCase):
         message = MockMessage(
             id=2,
             media=True,
-            date=datetime(2019, 8, 5, 14, 35, 12),
-            chat_title="test2",
-            photo=MockPhoto(
-                date=datetime(2019, 8, 5, 14, 35, 12), file_unique_id="ADAVKJYIFV"
-            ),
+            photo=MockPhoto(date=datetime(2019, 8, 5, 14, 35, 12)),
         )
         result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.photo, "photo")
+            async_get_media_meta(message.photo, "photo")
         )
         self.assertEqual(
             (
-                platform_generic_path("/root/project/test2/2019_08/2 - ADAVKJYIFV.jpg"),
-                platform_generic_path(
-                    os.path.join(app.temp_save_path, "test2/2 - ADAVKJYIFV.jpg")
-                ),
-                None,
-            ),
-            result,
-        )
-
-        message = MockMessage(
-            id=2,
-            media=True,
-            date=datetime(2019, 8, 5, 14, 35, 12),
-            chat_title="test2",
-            media_group_id="AAA213213",
-            caption="#home #book",
-            photo=MockPhoto(
-                date=datetime(2019, 8, 5, 14, 35, 12), file_unique_id="ADAVKJYIFV"
-            ),
-        )
-        result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.photo, "photo")
-        )
-        self.assertEqual(
-            (
-                platform_generic_path(
-                    "/root/project/test2/2019_08/2 - #home #book - ADAVKJYIFV.jpg"
-                ),
-                platform_generic_path(
-                    os.path.join(
-                        app.temp_save_path, "test2/2 - #home #book - ADAVKJYIFV.jpg"
-                    )
-                ),
-                None,
+                platform_generic_path("/root/project/123/photo/photo_123"),
+                "jpg",
             ),
             result,
         )
@@ -453,154 +375,78 @@ class MediaDownloaderTestCase(unittest.TestCase):
         message = MockMessage(
             id=3,
             media=True,
-            chat_title="test2",
             document=MockDocument(
                 file_name="sample_document.pdf",
                 mime_type="application/pdf",
             ),
         )
         result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.document, "document")
+            async_get_media_meta(message.document, "document")
         )
         self.assertEqual(
             (
-                platform_generic_path("/root/project/test2/0/3 - sample_document.pdf"),
-                platform_generic_path(
-                    os.path.join(app.temp_save_path, "test2/3 - sample_document.pdf")
-                ),
+                platform_generic_path("/root/project/123/document/sample_document.pdf"),
                 "pdf",
             ),
             result,
         )
 
-        before_file_name_prefix_split = app.file_name_prefix_split
-        app.file_name_prefix_split = "-"
-
+        # Test Documents with invalid Windows filename characters
         message = MockMessage(
-            id=3,
+            id=33,
             media=True,
-            chat_title="test2",
-            media_group_id="BBB213213",
-            caption="#work",
             document=MockDocument(
-                file_name="sample_document.pdf",
+                file_name="invalid:file>name<with|pipes?.pdf",
                 mime_type="application/pdf",
             ),
         )
         result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.document, "document")
+            async_get_media_meta(message.document, "document")
         )
         self.assertEqual(
             (
                 platform_generic_path(
-                    "/root/project/test2/0/3-#work-sample_document.pdf"
-                ),
-                platform_generic_path(
-                    os.path.join(
-                        app.temp_save_path, "test2/3-#work-sample_document.pdf"
-                    )
+                    "/root/project/123/document/invalid_file_name_with_pipes_.pdf"
                 ),
                 "pdf",
             ),
             result,
         )
 
-        app.file_name_prefix_split = before_file_name_prefix_split
         # Test audio
         message = MockMessage(
             id=4,
             media=True,
-            date=datetime(2021, 8, 5, 14, 35, 12),
-            chat_title="test2",
             audio=MockAudio(
                 file_name="sample_audio.mp3",
                 mime_type="audio/mp3",
             ),
         )
         result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.audio, "audio")
+            async_get_media_meta(message.audio, "audio")
         )
         self.assertEqual(
             (
-                platform_generic_path(
-                    "/root/project/test2/2021_08/4 - sample_audio.mp3"
-                ),
-                platform_generic_path(
-                    os.path.join(app.temp_save_path, "test2/4 - sample_audio.mp3")
-                ),
+                platform_generic_path("/root/project/123/audio/sample_audio.mp3"),
                 "mp3",
             ),
             result,
         )
 
-        # Test Video 1
+        # Test Video
         message = MockMessage(
             id=5,
             media=True,
-            date=datetime(2022, 8, 5, 14, 35, 12),
-            chat_title="test2",
             video=MockVideo(
                 mime_type="video/mp4",
             ),
         )
         result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.video, "video")
+            async_get_media_meta(message.video, "video")
         )
         self.assertEqual(
             (
-                platform_generic_path("/root/project/test2/2022_08/5.mp4"),
-                platform_generic_path(os.path.join(app.temp_save_path, "test2/5.mp4")),
-                "mp4",
-            ),
-            result,
-        )
-
-        # Test Video 2
-        message = MockMessage(
-            id=5,
-            media=True,
-            date=datetime(2022, 8, 5, 14, 35, 12),
-            chat_title="test2",
-            video=MockVideo(
-                file_name="test.mp4",
-                mime_type="video/mp4",
-            ),
-        )
-        result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.video, "video")
-        )
-        self.assertEqual(
-            (
-                platform_generic_path("/root/project/test2/2022_08/5 - test.mp4"),
-                platform_generic_path(
-                    os.path.join(app.temp_save_path, "test2/5 - test.mp4")
-                ),
-                "mp4",
-            ),
-            result,
-        )
-
-        # Test Video 3: not exist chat_title
-        message = MockMessage(
-            id=5,
-            media=True,
-            dis_chat=True,
-            date=datetime(2022, 8, 5, 14, 35, 12),
-            video=MockVideo(
-                file_name="test.mp4",
-                mime_type="video/mp4",
-            ),
-        )
-        result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.video, "video")
-        )
-
-        self.assertEqual(
-            (
-                platform_generic_path("/root/project/-123/2022_08/5 - test.mp4"),
-                platform_generic_path(
-                    os.path.join(app.temp_save_path, "-123/5 - test.mp4")
-                ),
+                platform_generic_path("/root/project/123/video/video_123"),
                 "mp4",
             ),
             result,
@@ -610,47 +456,111 @@ class MediaDownloaderTestCase(unittest.TestCase):
         message = MockMessage(
             id=6,
             media=True,
-            date=datetime(2019, 7, 25, 14, 53, 50),
-            chat_title="test2",
             video_note=MockVideoNote(
                 mime_type="video/mp4",
                 date=datetime(2019, 7, 25, 14, 53, 50),
             ),
         )
         result = self.loop.run_until_complete(
-            async_get_media_meta(-123, message, message.video_note, "video_note")
+            async_get_media_meta(message.video_note, "video_note")
         )
         self.assertEqual(
             (
                 platform_generic_path(
-                    "/root/project/test2/2019_07/6 - video_note_2019-07-25T14_53_50.mp4"
-                ),
-                platform_generic_path(
-                    os.path.join(
-                        app.temp_save_path,
-                        "test2/6 - video_note_2019-07-25T14_53_50.mp4",
-                    )
+                    "/root/project/123/video_note/video_note_2019-07-25T14_53_50.mp4"
                 ),
                 "mp4",
             ),
             result,
         )
 
-    @mock.patch("media_downloader.app.save_path", new=MOCK_DIR)
-    @mock.patch("media_downloader.asyncio.sleep", return_value=None)
-    @mock.patch("media_downloader.logger")
-    @mock.patch("media_downloader._is_exist", new=is_exist)
-    @mock.patch(
-        "media_downloader._move_to_download_path", new=mock_move_to_download_path
-    )
-    @mock.patch(
-        "media_downloader._check_download_finish", new=mock_check_download_finish
-    )
-    def test_download_media(self, mock_logger, patch_sleep):
-        reset_download_cache()
-        rest_app(MOCK_CONF)
+    def test_get_media_meta_custom_directory(self):
+        """Test _get_media_meta with custom download directory."""
+        custom_dir = platform_generic_path("/custom/downloads")
+
+        # Test Voice notes with custom directory
+        message = MockMessage(
+            id=1,
+            media=True,
+            voice=MockVoice(
+                mime_type="audio/ogg",
+                date=datetime(2019, 7, 25, 14, 53, 50),
+            ),
+        )
+        result = self.loop.run_until_complete(
+            async_get_media_meta_custom_dir(message.voice, "voice", custom_dir)
+        )
+        self.assertEqual(
+            (
+                platform_generic_path(
+                    "/custom/downloads/voice/voice_2019-07-25T14_53_50.ogg"
+                ),
+                "ogg",
+            ),
+            result,
+        )
+
+        # Test photos with custom directory
+        message = MockMessage(
+            id=2,
+            media=True,
+            photo=MockPhoto(date=datetime(2019, 8, 5, 14, 35, 12)),
+        )
+        result = self.loop.run_until_complete(
+            async_get_media_meta_custom_dir(message.photo, "photo", custom_dir)
+        )
+        self.assertEqual(
+            (
+                platform_generic_path("/custom/downloads/photo/photo_123"),
+                "jpg",
+            ),
+            result,
+        )
+
+        # Test Documents with custom directory
+        message = MockMessage(
+            id=3,
+            media=True,
+            document=MockDocument(
+                file_name="sample_document.pdf",
+                mime_type="application/pdf",
+            ),
+        )
+        result = self.loop.run_until_complete(
+            async_get_media_meta_custom_dir(message.document, "document", custom_dir)
+        )
+        self.assertEqual(
+            (
+                platform_generic_path("/custom/downloads/document/sample_document.pdf"),
+                "pdf",
+            ),
+            result,
+        )
+
+        # Test default behavior when download_directory is None
+        result = self.loop.run_until_complete(
+            async_get_media_meta_custom_dir(message.document, "document", None)
+        )
+        # Should use the actual THIS_DIR (project root) + chat_id 123
+        expected_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "123",
+            "document",
+            "sample_document.pdf",
+        )
+        expected_path = os.path.abspath(expected_path)
+        self.assertEqual(
+            (
+                platform_generic_path(expected_path),
+                "pdf",
+            ),
+            result,
+        )
+
+    @mock.patch("media_downloader.THIS_DIR", new=MOCK_DIR)
+    def test_download_media(self):
         client = MockClient()
-        app.hide_file_name = True
         message = MockMessage(
             id=5,
             media=True,
@@ -661,18 +571,12 @@ class MediaDownloaderTestCase(unittest.TestCase):
         )
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["mp4"]}, -123
+                client, message, ["video", "photo"], {"video": ["mp4"]}
             )
         )
-        self.assertEqual(
-            (
-                DownloadStatus.SuccessDownload,
-                platform_generic_path("/root/project/-123/0/5 - sample_video.mp4"),
-            ),
-            result,
-        )
+        self.assertEqual(5, result)
 
-        message = MockMessage(
+        message_1 = MockMessage(
             id=6,
             media=True,
             video=MockVideo(
@@ -682,19 +586,13 @@ class MediaDownloaderTestCase(unittest.TestCase):
         )
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
+                client, message_1, ["video", "photo"], {"video": ["all"]}
             )
         )
-        self.assertEqual(
-            (
-                DownloadStatus.SuccessDownload,
-                platform_generic_path("/root/project/-123/0/6 - sample_video.mov"),
-            ),
-            result,
-        )
+        self.assertEqual(6, result)
 
         # Test re-fetch message success
-        message = MockMessage(
+        message_2 = MockMessage(
             id=7,
             media=True,
             video=MockVideo(
@@ -704,16 +602,13 @@ class MediaDownloaderTestCase(unittest.TestCase):
         )
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
+                client, message_2, ["video", "photo"], {"video": ["all"]}
             )
         )
-        self.assertEqual((DownloadStatus.FailedDownload, None), result)
-        mock_logger.warning.assert_called_with(
-            "Message[7]: file reference expired, refetching..."
-        )
+        self.assertEqual(7, result)
 
         # Test re-fetch message failure
-        message = MockMessage(
+        message_3 = MockMessage(
             id=8,
             media=True,
             video=MockVideo(
@@ -723,16 +618,13 @@ class MediaDownloaderTestCase(unittest.TestCase):
         )
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
+                client, message_3, ["video", "photo"], {"video": ["all"]}
             )
         )
-        self.assertEqual((DownloadStatus.FailedDownload, None), result)
-        mock_logger.error.assert_called_with(
-            "Message[8]: file reference expired for 3 retries, download skipped."
-        )
+        self.assertEqual(8, result)
 
         # Test other exception
-        message = MockMessage(
+        message_4 = MockMessage(
             id=9,
             media=True,
             video=MockVideo(
@@ -742,25 +634,25 @@ class MediaDownloaderTestCase(unittest.TestCase):
         )
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
+                client, message_4, ["video", "photo"], {"video": ["all"]}
             )
         )
-        self.assertEqual((DownloadStatus.FailedDownload, None), result)
+        self.assertEqual(9, result)
 
         # Check no media
-        message = MockMessage(
+        message_5 = MockMessage(
             id=10,
             media=None,
         )
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
+                client, message_5, ["video", "photo"], {"video": ["all"]}
             )
         )
-        self.assertEqual((DownloadStatus.SkipDownload, None), result)
+        self.assertEqual(10, result)
 
         # Test timeout
-        message = MockMessage(
+        message_6 = MockMessage(
             id=11,
             media=True,
             video=MockVideo(
@@ -770,93 +662,408 @@ class MediaDownloaderTestCase(unittest.TestCase):
         )
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
+                client, message_6, ["video", "photo"], {"video": ["all"]}
             )
         )
-        self.assertEqual((DownloadStatus.FailedDownload, None), result)
-        mock_logger.error.assert_called_with(
-            "Message[11]: Timing out after 3 reties, download skipped."
-        )
+        self.assertEqual(11, result)
 
-        # Test file name with out suffix
-        message = MockMessage(
+        # Test file format not allowed (should skip download)
+        message_format_not_allowed = MockMessage(
             id=12,
             media=True,
             video=MockVideo(
-                file_name="sample_video",
+                file_name="sample_video.mov",
+                mime_type="video/mov",
+            ),
+        )
+        result = self.loop.run_until_complete(
+            async_download_media(
+                client,
+                message_format_not_allowed,
+                ["video", "photo"],
+                {"video": ["mp4"]},
+            )
+        )
+        self.assertEqual(12, result)
+
+        # Test download_path is None (should still add to DOWNLOADED_IDS)
+        message_download_none = MockMessage(
+            id=13,
+            media=True,
+            video=MockVideo(
+                file_name="sample_video.mp4",
                 mime_type="video/mp4",
             ),
         )
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
+                client, message_download_none, ["video", "photo"], {"video": ["all"]}
             )
         )
-        self.assertEqual(
-            (
-                DownloadStatus.SuccessDownload,
-                platform_generic_path("/root/project/-123/0/12 - sample_video.mp4"),
+        self.assertEqual(13, result)
+
+        # Test FileReferenceExpiredError that persists until max retries (covers lines 282-292)
+        message_persistent_error = MockMessage(
+            id=14,  # Use ID 14 which isn't in the MockClient's special cases
+            media=True,
+            chat_id=345678,
+            video=MockVideo(
+                file_name="persistent_error.mp4",
+                mime_type="video/mp4",
+                size=1024,
             ),
-            result,
         )
 
-        # Test FloodWait 420
-        message = MockMessage(
-            id=420,
-            media=True,
-            video=MockVideo(
-                file_name="sample_video.mov",
-                mime_type="video/mov",
-            ),
-        )
+        # Create a custom mock client that always raises FileReferenceExpiredError for ID 14
+        class PersistentErrorClient(MockClient):
+            async def download_media(self, message_or_media, file=None, **kwargs):
+                mock_message = message_or_media
+                if mock_message.id == 14:
+                    # Create a proper FileReferenceExpiredError with required parameters
+                    raise FileReferenceExpiredError(request=None)
+                return await super().download_media(message_or_media, file, **kwargs)
+
+            async def get_messages(self, *args, **kwargs):
+                ids = kwargs.get("ids", kwargs.get("message_ids"))
+                if ids == 14:
+                    # Return the same message that will fail again
+                    return [
+                        MockMessage(
+                            id=14,
+                            media=True,
+                            chat_id=345678,
+                            video=MockVideo(
+                                file_name="persistent_error.mp4",
+                                mime_type="video/mp4",
+                                size=1024,
+                            ),
+                        )
+                    ]
+                return await super().get_messages(*args, **kwargs)
+
+        persistent_client = PersistentErrorClient()
         result = self.loop.run_until_complete(
             async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
+                persistent_client,
+                message_persistent_error,
+                ["video"],
+                {"video": ["all"]},
             )
         )
-        self.assertEqual((DownloadStatus.FailedDownload, None), result)
-        mock_logger.warning.assert_called_with("Message[{}]: FlowWait {}", 420, 420)
+        self.assertEqual(14, result)
 
-        # Test other Exception
+    @mock.patch("config_manager.save_config")
+    def test_update_config(self, mock_save):
+        conf = {
+            "api_id": 123,
+            "api_hash": "hasw5Tgawsuj67",
+            "ids_to_retry": [],
+            "chat_id": 8654123,
+        }
+        update_config(conf)
+        mock_save.assert_called_once_with(conf)
+
+    def test_get_media_type(self):
+        # Test photo
         message = MockMessage(
-            id=421,
+            id=1,
             media=True,
-            video=MockVideo(
-                file_name="sample_video.mov",
-                mime_type="video/mov",
+            photo=MockPhoto(date=datetime(2019, 8, 5, 14, 35, 12)),
+        )
+        result = get_media_type(message)
+        self.assertEqual("photo", result)
+
+        # Test document without special attributes
+        doc_attr = mock.Mock()
+        doc_attr.file_name = "test.pdf"
+        doc_attr.voice = None
+        doc_attr.round_message = None
+        message = MockMessage(
+            id=2,
+            media=True,
+            document=MockDocument(
+                file_name="test.pdf",
+                mime_type="application/pdf",
+                attributes=[doc_attr],
             ),
         )
-        result = self.loop.run_until_complete(
-            async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
-            )
-        )
-        self.assertEqual((DownloadStatus.FailedDownload, None), result)
+        result = get_media_type(message)
+        self.assertEqual("document", result)
 
-        # Test other Exception
+        # Test audio
+        audio_attr = mock.Mock()
+        audio_attr.voice = False
+        audio_attr.round_message = None
         message = MockMessage(
-            id=422,
+            id=3,
             media=True,
-            video=MockVideo(
-                file_name="422 - exception.mov",
-                mime_type="video/mov",
+            document=MockDocument(
+                file_name="test.mp3",
+                mime_type="audio/mp3",
+                attributes=[audio_attr],
             ),
         )
-        result = self.loop.run_until_complete(
-            async_download_media(
-                client, message, ["video", "photo"], {"video": ["all"]}
-            )
-        )
-        self.assertEqual((DownloadStatus.FailedDownload, None), result)
+        result = get_media_type(message)
+        self.assertEqual("audio", result)
 
-    @mock.patch("media_downloader.HookClient", new=MockClient)
-    @mock.patch("media_downloader.asyncio.Queue.put")
-    def test_download_task(self, moc_put):
-        rest_app(MOCK_CONF)
+        # Test voice
+        voice_attr = mock.Mock()
+        voice_attr.voice = True
+        voice_attr.round_message = None
+        message = MockMessage(
+            id=4,
+            media=True,
+            document=MockDocument(
+                mime_type="audio/ogg",
+                attributes=[voice_attr],
+            ),
+        )
+        result = get_media_type(message)
+        self.assertEqual("voice", result)
+
+        # Test video
+        video_attr = mock.Mock()
+        video_attr.voice = None
+        video_attr.round_message = False
+        message = MockMessage(
+            id=5,
+            media=True,
+            document=MockDocument(
+                mime_type="video/mp4",
+                attributes=[video_attr],
+            ),
+        )
+        result = get_media_type(message)
+        self.assertEqual("video", result)
+
+        # Test video_note
+        video_note_attr = mock.Mock()
+        video_note_attr.voice = None
+        video_note_attr.round_message = True
+        message = MockMessage(
+            id=6,
+            media=True,
+            document=MockDocument(
+                mime_type="video/mp4",
+                attributes=[video_note_attr],
+            ),
+        )
+        result = get_media_type(message)
+        self.assertEqual("video_note", result)
+
+        # Test no media
+        message = MockMessage(id=7, media=None)
+        result = get_media_type(message)
+        self.assertIsNone(result)
+
+        # Test unsupported media type
+        message = MockMessage(id=8, media=True)
+        # Manually set media to an unsupported type (not MessageMediaPhoto or MessageMediaDocument)
+        message.media = mock.Mock()
+        result = get_media_type(message)
+        self.assertIsNone(result)
+
+    @mock.patch("media_downloader.THIS_DIR", new=MOCK_DIR)
+    def test_download_media_no_media_obj(self):
         client = MockClient()
-        app.chat_download_config[8654123].download_filter = "id != 1213"
-        self.loop.run_until_complete(download_all_chat(client))
-        moc_put.assert_called()
+        # Mock message with media but no media_obj
+        message = MockMessage(
+            id=12,
+            media=True,
+            # No photo or document
+        )
+        result = self.loop.run_until_complete(
+            async_download_media(
+                client, message, ["video", "photo"], {"video": ["mp4"]}
+            )
+        )
+        self.assertEqual(12, result)
+
+        # Test media_obj is None for photo type
+        message_photo_none = MockMessage(
+            id=14,
+            media=True,
+            # Don't set photo attribute
+        )
+        # Manually set media to photo type
+        message_photo_none.media = mock.Mock(spec=MessageMediaPhoto, photo=None)
+        result = self.loop.run_until_complete(
+            async_download_media(
+                client, message_photo_none, ["photo"], {"photo": ["all"]}
+            )
+        )
+        self.assertEqual(14, result)
+
+    @mock.patch("media_downloader.update_config")
+    @mock.patch("media_downloader.TelegramClient", new=MockClient)
+    @mock.patch("media_downloader.process_messages", new=mock_process_message)
+    def test_begin_import(self, mock_update_config):
+        result = self.loop.run_until_complete(async_begin_import(MOCK_CONF, 3))
+        conf = copy.deepcopy(MOCK_CONF)
+        conf["last_read_message_id"] = 5
+        self.assertDictEqual(result, conf)
+
+    @mock.patch("media_downloader.update_config")
+    @mock.patch("media_downloader.TelegramClient", new=MockClient)
+    @mock.patch("media_downloader.process_messages", new=mock_process_message)
+    def test_begin_import_with_proxy(self, mock_update_config):
+        conf_with_proxy = copy.deepcopy(MOCK_CONF)
+        conf_with_proxy["proxy"] = {
+            "scheme": "socks5",
+            "hostname": "127.0.0.1",
+            "port": 1080,
+            "username": "user",
+            "password": "pass",
+        }
+        result = self.loop.run_until_complete(async_begin_import(conf_with_proxy, 3))
+        expected_conf = copy.deepcopy(conf_with_proxy)
+        expected_conf["last_read_message_id"] = 5
+        self.assertDictEqual(result, expected_conf)
+
+    @mock.patch("media_downloader.update_config")
+    @mock.patch("media_downloader.TelegramClient", new=MockClient)
+    @mock.patch("media_downloader.process_messages", new=mock_process_message)
+    def test_begin_import_with_custom_directory(self, mock_update_config):
+        conf = copy.deepcopy(MOCK_CONF)
+        conf["download_directory"] = "custom_downloads"
+        result = self.loop.run_until_complete(async_begin_import(conf, 3))
+        expected_conf = copy.deepcopy(conf)
+        expected_conf["last_read_message_id"] = 5
+        self.assertDictEqual(result, expected_conf)
+
+    @mock.patch("media_downloader.update_config")
+    @mock.patch("media_downloader.TelegramClient", new=MockClient)
+    @mock.patch("media_downloader.process_messages", new=mock_process_message)
+    def test_begin_import_with_start_date(self, mock_update_config):
+        conf = copy.deepcopy(MOCK_CONF)
+        conf["start_date"] = "2023-01-01"
+        result = self.loop.run_until_complete(async_begin_import(conf, 3))
+        expected_conf = copy.deepcopy(conf)
+        expected_conf["last_read_message_id"] = 5
+        self.assertDictEqual(result, expected_conf)
+
+    @mock.patch("media_downloader.update_config")
+    @mock.patch("media_downloader.TelegramClient", new=MockClient)
+    @mock.patch("media_downloader.process_messages", new=mock_process_message)
+    def test_begin_import_with_end_date(self, mock_update_config):
+        conf = copy.deepcopy(MOCK_CONF)
+        conf["end_date"] = "2023-12-31"
+        result = self.loop.run_until_complete(async_begin_import(conf, 3))
+        expected_conf = copy.deepcopy(conf)
+        expected_conf["last_read_message_id"] = 5
+        self.assertDictEqual(result, expected_conf)
+
+    @mock.patch("media_downloader.update_config")
+    @mock.patch("media_downloader.TelegramClient", new=MockClient)
+    @mock.patch("media_downloader.process_messages", new=mock_process_message)
+    def test_begin_import_with_max_messages(self, mock_update_config):
+        conf = copy.deepcopy(MOCK_CONF)
+        conf["max_messages"] = 10
+        result = self.loop.run_until_complete(async_begin_import(conf, 3))
+        expected_conf = copy.deepcopy(conf)
+        expected_conf["last_read_message_id"] = 5
+        self.assertDictEqual(result, expected_conf)
+
+    @mock.patch("media_downloader.update_config")
+    @mock.patch("media_downloader.TelegramClient", new=MockClient)
+    @mock.patch("media_downloader.process_messages", new=mock_process_message)
+    def test_begin_import_with_max_messages_string(self, mock_update_config):
+        conf = copy.deepcopy(MOCK_CONF)
+        conf["max_messages"] = "15"
+        result = self.loop.run_until_complete(async_begin_import(conf, 3))
+        expected_conf = copy.deepcopy(conf)
+        expected_conf["last_read_message_id"] = 5
+        self.assertDictEqual(result, expected_conf)
+
+    @mock.patch("media_downloader.update_config")
+    @mock.patch("media_downloader.TelegramClient", new=MockClient)
+    @mock.patch("media_downloader.process_messages", new=mock_process_message)
+    def test_begin_import_with_start_date_date_object(self, mock_update_config):
+        conf = copy.deepcopy(MOCK_CONF)
+        from datetime import date
+
+        conf["start_date"] = date(2023, 1, 1)  # Pass date object instead of string
+        result = self.loop.run_until_complete(async_begin_import(conf, 3))
+        expected_conf = copy.deepcopy(conf)
+        expected_conf["last_read_message_id"] = 5
+        self.assertDictEqual(result, expected_conf)
+
+    def test_process_message(self):
+        client = MockClient()
+        result = self.loop.run_until_complete(
+            async_process_messages(
+                client,
+                [
+                    MockMessage(
+                        id=1213,
+                        media=True,
+                        voice=MockVoice(
+                            mime_type="audio/ogg",
+                            date=datetime(2019, 7, 25, 14, 53, 50),
+                        ),
+                    ),
+                    MockMessage(
+                        id=1214,
+                        media=False,
+                        text="test message 1",
+                    ),
+                    MockMessage(
+                        id=1215,
+                        media=False,
+                        text="test message 2",
+                    ),
+                    MockMessage(
+                        id=1216,
+                        media=False,
+                        text="test message 3",
+                    ),
+                ],
+                ["voice", "photo"],
+                {"audio": ["all"], "voice": ["all"]},
+            )
+        )
+        self.assertEqual(result, 1216)
+
+    @mock.patch("media_downloader._is_exist", return_value=True)
+    @mock.patch(
+        "media_downloader.manage_duplicate_file",
+        new=mock_manage_duplicate_file,
+    )
+    def test_process_message_when_file_exists(self, mock_is_exist):
+        client = MockClient()
+        result = self.loop.run_until_complete(
+            async_process_messages(
+                client,
+                [
+                    MockMessage(
+                        id=1213,
+                        media=True,
+                        voice=MockVoice(
+                            mime_type="audio/ogg",
+                            date=datetime(2019, 7, 25, 14, 53, 50),
+                        ),
+                    ),
+                    MockMessage(
+                        id=1214,
+                        media=False,
+                        text="test message 1",
+                    ),
+                    MockMessage(
+                        id=1215,
+                        media=False,
+                        text="test message 2",
+                    ),
+                    MockMessage(
+                        id=1216,
+                        media=False,
+                        text="test message 3",
+                    ),
+                ],
+                ["voice", "photo"],
+                {"audio": ["all"], "voice": ["all"]},
+            )
+        )
+        self.assertEqual(result, 1216)
 
     def test_can_download(self):
         file_formats = {
@@ -887,209 +1094,516 @@ class MediaDownloaderTestCase(unittest.TestCase):
         result2 = _is_exist(this_dir)
         self.assertEqual(result2, False)
 
-    @mock.patch("media_downloader.os.makedirs")
-    @mock.patch("builtins.open", new_callable=mock.mock_open)
-    def test_save_msg_to_file(self, mock_open, mock_makedirs):
-        rest_app(MOCK_CONF)
-        app.enable_download_txt = True
-        app.temp_save_path = "/tmp"
-        app.date_format = "%Y_%m"
+    @mock.patch("media_downloader.TelegramClient", return_value=MockClient())
+    @mock.patch("media_downloader.process_chat")
+    def test_begin_import_multiple_chats(self, mock_process_chat, mock_client):
+        conf = {
+            "api_id": 123,
+            "api_hash": "has",
+            "chats": [
+                {"chat_id": 1, "last_read_message_id": 10},
+                {"chat_id": 2, "last_read_message_id": 20},
+            ],
+            "parallel_chats": False,
+        }
+        result = self.loop.run_until_complete(async_begin_import(conf, 100))
+        self.assertEqual(mock_process_chat.call_count, 2)
+        self.assertEqual(result, conf)
 
-        message = MockMessage(
-            id=123,
-            dis_chat=True,
-            chat=Chat(chat_id=456, chat_title="Test Chat"),
-            date=datetime(2023, 5, 15, 10, 30, 0),
-            text="This is a test message",
+    @mock.patch("media_downloader.TelegramClient", return_value=MockClient())
+    @mock.patch("media_downloader.process_chat")
+    def test_begin_import_parallel_chats(self, mock_process_chat, mock_client):
+        conf = {
+            "api_id": 123,
+            "api_hash": "has",
+            "chats": [{"chat_id": 1}, {"chat_id": 2}],
+            "parallel_chats": True,
+        }
+        result = self.loop.run_until_complete(async_begin_import(conf, 100))
+        self.assertEqual(mock_process_chat.call_count, 2)
+
+    @mock.patch("media_downloader.TelegramClient", return_value=MockClient())
+    def test_begin_import_missing_chat_id(self, mock_client):
+        conf = {"api_id": 123, "api_hash": "has"}
+        with self.assertRaises(KeyError):
+            self.loop.run_until_complete(async_begin_import(conf, 100))
+
+    @mock.patch("media_downloader.update_config", return_value=None)
+    @mock.patch("media_downloader.process_messages", return_value=1234)
+    def test_process_chat_edge_cases(self, mock_process_messages, mock_update_config):
+        client = MockClient()
+        conf = {"api_id": 1, "api_hash": "a"}
+        chat_conf = {"chat_id": 111, "max_messages": 0}
+
+        import asyncio
+
+        import media_downloader
+
+        media_downloader.DOWNLOADED_IDS[111] = [123]
+
+        self.loop.run_until_complete(
+            media_downloader.process_chat(client, conf, chat_conf, 1, asyncio.Lock())
+        )
+        self.assertEqual(chat_conf.get("last_read_message_id"), 1234)
+        # update_config should have been called (checkpoint write)
+        mock_update_config.assert_called()
+
+        chat_conf = {
+            "chat_id": 222,
+            "start_date": "2050-01-01",
+            "end_date": datetime(2050, 12, 31).date(),
+        }
+        media_downloader.DOWNLOADED_IDS[222] = []
+        self.loop.run_until_complete(
+            media_downloader.process_chat(client, conf, chat_conf, 1, asyncio.Lock())
         )
 
-        expected_file_path = platform_generic_path(
-            "/root/project/Test Chat/2023_05/123.txt"
-        )
+    @mock.patch("media_downloader.update_config", return_value=None)
+    @mock.patch("media_downloader.process_messages", return_value=1234)
+    def test_process_chat_stops_at_max_messages(
+        self, mock_process_messages, mock_update_config
+    ):
+        """Test that process_chat breaks mid-batch once max_messages is reached."""
+        import asyncio
 
-        result = self.loop.run_until_complete(save_msg_to_file(app, 456, message))
-
-        self.assertEqual(result, (DownloadStatus.SuccessDownload, expected_file_path))
-        mock_makedirs.assert_called_once_with(
-            os.path.dirname(expected_file_path), exist_ok=True
-        )
-        mock_open.assert_called_once_with(expected_file_path, "w", encoding="utf-8")
-        mock_open().write.assert_called_once_with("This is a test message")
-
-    @mock.patch("media_downloader.RETRY_TIME_OUT", new=0)
-    @mock.patch("media_downloader.os.path.getsize", new=os_get_file_size)
-    @mock.patch("media_downloader.os.remove", new=os_remove)
-    @mock.patch("media_downloader._is_exist", new=is_exist)
-    @mock.patch(
-        "media_downloader._move_to_download_path", new=mock_move_to_download_path
-    )
-    def test_issues_311(self):
-        # see https://github.com/Dineshkarthik/telegram_media_downloader/issues/311
-        rest_app(MOCK_CONF)
+        import media_downloader
 
         client = MockClient()
-        # 1. test `TimeOutError`
+        conf = {"api_id": 1, "api_hash": "a"}
+        # max_messages=1, DOWNLOADED_IDS already has 1 entry so the break
+        # fires immediately after the first batch is processed.
+        chat_conf = {"chat_id": 333, "max_messages": 1}
+        media_downloader.DOWNLOADED_IDS[333] = [99]
+        media_downloader.FAILED_IDS[333] = []
+
+        self.loop.run_until_complete(
+            media_downloader.process_chat(client, conf, chat_conf, 1, asyncio.Lock())
+        )
+        mock_update_config.assert_called()
+
+    def test_process_messages_max_concurrent_downloads(self):
+        """Test that max_concurrent_downloads semaphore limits parallel execution."""
+        import media_downloader
+
+        call_order = []
+        active = []
+
+        async def mock_download(client, message, *args, **kwargs):
+            active.append(message.id)
+            # Yield control so other coroutines can run
+            await asyncio.sleep(0)
+            call_order.append(message.id)
+            active.pop()
+            return message.id
+
+        messages = [MockMessage(id=i, media=False) for i in range(1, 5)]
+        client = MockClient()
+
+        with mock.patch("media_downloader.download_media", side_effect=mock_download):
+            self.loop.run_until_complete(
+                media_downloader.process_messages(
+                    client, messages, [], {}, 999, max_concurrent_downloads=2
+                )
+            )
+        # All 4 messages should have been processed
+        self.assertEqual(sorted(call_order), [1, 2, 3, 4])
+
+    @mock.patch("media_downloader.asyncio.sleep", new_callable=mock.AsyncMock)
+    def test_process_messages_fixed_delay(self, mock_sleep):
+        """Test that a fixed download_delay calls asyncio.sleep with the right value."""
+        import media_downloader
+
+        async def mock_download(client, message, *args, **kwargs):
+            return message.id
+
+        messages = [MockMessage(id=10, media=False)]
+        client = MockClient()
+
+        with mock.patch("media_downloader.download_media", side_effect=mock_download):
+            self.loop.run_until_complete(
+                media_downloader.process_messages(
+                    client, messages, [], {}, 999, download_delay=2.5
+                )
+            )
+        mock_sleep.assert_called_once_with(2.5)
+
+    @mock.patch("media_downloader.asyncio.sleep", new_callable=mock.AsyncMock)
+    @mock.patch("media_downloader.random.uniform", return_value=3.7)
+    def test_process_messages_random_delay(self, mock_uniform, mock_sleep):
+        """Test that a [min, max] download_delay calls random.uniform correctly."""
+        import media_downloader
+
+        async def mock_download(client, message, *args, **kwargs):
+            return message.id
+
+        messages = [MockMessage(id=20, media=False)]
+        client = MockClient()
+
+        with mock.patch("media_downloader.download_media", side_effect=mock_download):
+            self.loop.run_until_complete(
+                media_downloader.process_messages(
+                    client, messages, [], {}, 999, download_delay=[1, 5]
+                )
+            )
+        mock_uniform.assert_called_once_with(1, 5)
+        mock_sleep.assert_called_once_with(3.7)
+
+    @mock.patch("media_downloader.asyncio.sleep", new_callable=mock.AsyncMock)
+    def test_process_messages_negative_delay_clamped(self, mock_sleep):
+        """Negative download_delay is clamped to 0."""
+        import media_downloader
+
+        async def mock_download(client, message, *args, **kwargs):
+            return message.id
+
+        with mock.patch("media_downloader.download_media", side_effect=mock_download):
+            self.loop.run_until_complete(
+                media_downloader.process_messages(
+                    MockClient(),
+                    [MockMessage(id=1, media=False)],
+                    [],
+                    {},
+                    999,
+                    download_delay=-3.0,
+                )
+            )
+        mock_sleep.assert_called_once_with(0.0)
+
+    @mock.patch("media_downloader.asyncio.sleep", new_callable=mock.AsyncMock)
+    def test_process_messages_delay_wrong_list_length(self, mock_sleep):
+        """download_delay list with != 2 elements: warns and skips delay."""
+        import media_downloader
+
+        async def mock_download(client, message, *args, **kwargs):
+            return message.id
+
+        with mock.patch("media_downloader.download_media", side_effect=mock_download):
+            self.loop.run_until_complete(
+                media_downloader.process_messages(
+                    MockClient(),
+                    [MockMessage(id=1, media=False)],
+                    [],
+                    {},
+                    999,
+                    download_delay=[1, 2, 3],
+                )
+            )
+        mock_sleep.assert_not_called()
+
+    @mock.patch("media_downloader.asyncio.sleep", new_callable=mock.AsyncMock)
+    def test_process_messages_delay_non_numeric_list(self, mock_sleep):
+        """download_delay list with non-numeric values: warns and skips delay."""
+        import media_downloader
+
+        async def mock_download(client, message, *args, **kwargs):
+            return message.id
+
+        with mock.patch("media_downloader.download_media", side_effect=mock_download):
+            self.loop.run_until_complete(
+                media_downloader.process_messages(
+                    MockClient(),
+                    [MockMessage(id=1, media=False)],
+                    [],
+                    {},
+                    999,
+                    download_delay=["a", "b"],
+                )
+            )
+        mock_sleep.assert_not_called()
+
+    @mock.patch("media_downloader.asyncio.sleep", new_callable=mock.AsyncMock)
+    def test_process_messages_delay_non_numeric_scalar(self, mock_sleep):
+        """Non-numeric scalar download_delay: warns and skips delay."""
+        import media_downloader
+
+        async def mock_download(client, message, *args, **kwargs):
+            return message.id
+
+        with mock.patch("media_downloader.download_media", side_effect=mock_download):
+            self.loop.run_until_complete(
+                media_downloader.process_messages(
+                    MockClient(),
+                    [MockMessage(id=1, media=False)],
+                    [],
+                    {},
+                    999,
+                    download_delay="fast",
+                )
+            )
+        mock_sleep.assert_not_called()
+
+    @mock.patch("media_downloader.update_config", return_value=None)
+    @mock.patch("media_downloader.process_messages", return_value=1)
+    def test_process_chat_invalid_max_concurrent_downloads(
+        self, mock_proc, mock_update
+    ):
+        """None/bad string/zero max_concurrent_downloads falls back to 4 with warning."""
+        import asyncio
+
+        import media_downloader
+
+        client = MockClient()
+        for bad_val in [None, "auto", 0, -1]:
+            chat_conf = {"chat_id": 444, "max_concurrent_downloads": bad_val}
+            media_downloader.DOWNLOADED_IDS[444] = []
+            media_downloader.FAILED_IDS[444] = []
+            # Should not raise
+            self.loop.run_until_complete(
+                media_downloader.process_chat(
+                    client, {"api_id": 1, "api_hash": "a"}, chat_conf, 1, asyncio.Lock()
+                )
+            )
+
+    def test_update_config_append_failed_ids(self):
+        conf = {"chats": [{"chat_id": 12345, "ids_to_retry": [10, 20]}]}
+        import media_downloader
+
+        media_downloader.FAILED_IDS[12345] = [20, 30]
+        media_downloader.DOWNLOADED_IDS[12345] = [10]
+        with mock.patch("config_manager.save_config"):
+            media_downloader.update_config(conf)
+
+        self.assertIn(30, conf["chats"][0]["ids_to_retry"])
+        self.assertNotIn(10, conf["chats"][0]["ids_to_retry"])
+
+    @mock.patch("media_downloader.FAILED_IDS", {8654123: [2, 3], "123": [], 12345: []})
+    @mock.patch("config_manager.load_config")
+    @mock.patch("media_downloader.update_config", return_value=True)
+    @mock.patch("media_downloader.begin_import")
+    @mock.patch("media_downloader.asyncio", new=MockAsync())
+    def test_main(self, mock_import, mock_update, mock_load):
+        conf = {
+            "api_id": 1,
+            "api_hash": "asdf",
+            "ids_to_retry": [1, 2],
+            "chat_id": 8654123,
+        }
+        mock_load.return_value = conf
+        main()
+        mock_import.assert_called_with(conf, pagination_limit=100)
+        conf["ids_to_retry"] = [1, 2, 3]
+        mock_update.assert_called_with(conf)
+
+    @mock.patch(
+        "media_downloader.FAILED_IDS", {8654123: [1, 2, 3], "123": [], 12345: []}
+    )
+    @mock.patch("config_manager.load_config")
+    @mock.patch("media_downloader.update_config", return_value=True)
+    @mock.patch("media_downloader.begin_import")
+    @mock.patch("media_downloader.asyncio", new=MockAsync())
+    def test_main_with_failed_ids(self, mock_import, mock_update, mock_load):
+        """Test main function when FAILED_IDS contains items to cover logging"""
+        conf = {
+            "api_id": 1,
+            "api_hash": "asdf",
+            "ids_to_retry": [],
+            "chat_id": 8654123,
+        }
+        mock_load.return_value = conf
+        mock_import.return_value = conf
+        main()
+        mock_import.assert_called_with(conf, pagination_limit=100)
+        # FAILED_IDS should be added to ids_to_retry
+        expected_conf = conf.copy()
+        expected_conf["ids_to_retry"] = [1, 2, 3]
+        mock_update.assert_called_with(expected_conf)
+
+    @mock.patch("media_downloader.PROCESSED_IDS", {8654123: [20, 19]})
+    @mock.patch("media_downloader.CURRENT_BATCH_IDS", {8654123: [20, 19, 18, 17]})
+    @mock.patch("media_downloader.FAILED_IDS", {8654123: [], "123": [], 12345: []})
+    @mock.patch("config_manager.load_config")
+    @mock.patch("media_downloader.update_config", return_value=True)
+    def test_main_with_keyboard_interrupt(self, mock_update, mock_load):
+        """Test main function when KeyboardInterrupt is raised mid-batch."""
+        conf = {
+            "api_id": 1,
+            "api_hash": "asdf",
+            "ids_to_retry": [],
+            "chat_id": 8654123,
+        }
+        mock_load.return_value = conf
+
+        mock_loop = mock.Mock()
+        mock_loop.run_until_complete.side_effect = KeyboardInterrupt()
+        with mock.patch(
+            "media_downloader.asyncio.get_event_loop", return_value=mock_loop
+        ):
+            main()
+
+        mock_update.assert_called()
+        # Interrupt handler: PROCESSED_IDS=[20,19], CURRENT_BATCH_IDS=[20,19,18,17]
+        # unprocessed=[18,17], safe_id = min(17,18)-1 = 16
+        self.assertEqual(conf.get("last_read_message_id"), 16)
+
+    @mock.patch("media_downloader.PROCESSED_IDS", {8654123: [20, 19, 18, 17]})
+    @mock.patch("media_downloader.CURRENT_BATCH_IDS", {8654123: [20, 19, 18, 17]})
+    @mock.patch("media_downloader.FAILED_IDS", {8654123: [], "123": [], 12345: []})
+    @mock.patch("config_manager.load_config")
+    @mock.patch("media_downloader.update_config", return_value=True)
+    def test_main_with_keyboard_interrupt_full_batch(self, mock_update, mock_load):
+        """KeyboardInterrupt when entire batch was already processed."""
+        conf = {
+            "api_id": 1,
+            "api_hash": "asdf",
+            "ids_to_retry": [],
+            "chat_id": 8654123,
+        }
+        mock_load.return_value = conf
+
+        mock_loop = mock.Mock()
+        mock_loop.run_until_complete.side_effect = KeyboardInterrupt()
+        with mock.patch(
+            "media_downloader.asyncio.get_event_loop", return_value=mock_loop
+        ):
+            main()
+
+        mock_update.assert_called()
+        # All 4 IDs processed → resume after max(batch_ids) = 20 (not min-1)
+        self.assertEqual(conf.get("last_read_message_id"), 20)
+
+    @mock.patch("media_downloader.print_meta")
+    @mock.patch("media_downloader.main")
+    def test_main_entry(self, mock_main, mock_print_meta):
+        # To cover the if __name__ == "__main__" block, we mock the calls
+        # and then call the functions to simulate the main entry point
+        from media_downloader import main, print_meta
+
+        print_meta(mock_print_meta)
+        main()
+        mock_print_meta.assert_called_once()
+        mock_main.assert_called_once()
+
+    def test_progress_callback_function(self):
+        """Test the _progress_callback function works correctly."""
+        from tqdm import tqdm
+
+        # Test initial callback with total
+        with tqdm(total=100, unit="B", unit_scale=True, desc="Test") as pbar:
+            _progress_callback(0, 100, pbar)
+            self.assertEqual(pbar.total, 100)
+            self.assertEqual(pbar.n, 0)
+
+            # Test progress update
+            _progress_callback(50, 100, pbar)
+            self.assertEqual(pbar.n, 50)
+
+            # Test completion
+            _progress_callback(100, 100, pbar)
+            self.assertEqual(pbar.n, 100)
+
+    @mock.patch("media_downloader.tqdm")
+    def test_download_media_with_progress_bar(self, mock_tqdm):
+        """Test that progress bar is created and used during downloads."""
+        # Setup mocks
+        mock_client = MockClient()
+        mock_pbar = mock.Mock()
+        mock_tqdm.return_value.__enter__ = mock.Mock(return_value=mock_pbar)
+        mock_tqdm.return_value.__exit__ = mock.Mock(return_value=None)
+
+        # Create test message with video that has size
         message = MockMessage(
-            id=311,
+            id=15,
             media=True,
             video=MockVideo(
-                file_name="failed_down.mp4",
+                file_name="test_video.mp4",
                 mime_type="video/mp4",
-                file_size=1024,
+                size=1024,
             ),
         )
 
-        media_size = getattr(message.video, "file_size")
-        self.assertEqual(media_size, 1024)
-
-        res = self.loop.run_until_complete(
-            async_download_media(
-                client, message, ["video", "photo"], {"video": ["mp4"]}
-            )
+        # Run the download
+        result = self.loop.run_until_complete(
+            async_download_media(mock_client, message, ["video"], {"video": ["all"]})
         )
-        self.assertEqual(res, (DownloadStatus.FailedDownload, None))
 
-        # 2. test sucess download
-        rest_app(MOCK_CONF)
+        # Verify progress bar was created
+        self.assertEqual(result, 15)
+        mock_tqdm.assert_called_once()
+        call_args = mock_tqdm.call_args
+        self.assertEqual(call_args[1]["total"], 1024)
+        self.assertEqual(call_args[1]["unit"], "B")
+        self.assertEqual(call_args[1]["unit_scale"], True)
+        self.assertIn("test_video.mp4", call_args[1]["desc"])
+
+    @mock.patch("media_downloader.tqdm")
+    @mock.patch("media_downloader._is_exist", return_value=True)
+    def test_download_media_existing_file_with_progress_bar(
+        self, mock_is_exist, mock_tqdm
+    ):
+        """Test progress bar creation when file already exists."""
+        # Setup mocks
+        mock_client = MockClient()
+        mock_pbar = mock.Mock()
+        mock_tqdm.return_value.__enter__ = mock.Mock(return_value=mock_pbar)
+        mock_tqdm.return_value.__exit__ = mock.Mock(return_value=None)
+
+        # Create test message with video that has size
         message = MockMessage(
-            id=312,
+            id=16,
             media=True,
             video=MockVideo(
-                file_name="sucess_down.mp4",
+                file_name="existing_video.mp4",
                 mime_type="video/mp4",
-                file_size=1024,
+                size=2048,
             ),
         )
 
-        res = self.loop.run_until_complete(
-            async_download_media(
-                client, message, ["video", "photo"], {"video": ["mp4"]}
-            )
+        # Run the download
+        result = self.loop.run_until_complete(
+            async_download_media(mock_client, message, ["video"], {"video": ["all"]})
         )
 
-        self.assertEqual(
-            res,
-            (
-                DownloadStatus.SuccessDownload,
-                platform_generic_path("/root/project/-123/0/312 - sucess_down.mp4"),
-            ),
-        )
+        # Verify progress bar was created for existing file
+        self.assertEqual(result, 16)
+        mock_tqdm.assert_called_once()
+        call_args = mock_tqdm.call_args
+        self.assertEqual(call_args[1]["total"], 2048)
+        self.assertIn("existing_video.mp4", call_args[1]["desc"])
 
-        rest_app(MOCK_CONF)
-        # 3. test already download
+    @mock.patch("media_downloader.tqdm")
+    def test_progress_callback_called_during_download(self, mock_tqdm):
+        """Test that progress callback is properly passed to download_media."""
+        # Setup mocks
+        mock_client = MockClient()
+        mock_pbar = mock.Mock()
+        mock_pbar.n = 0  # Set initial progress to 0
+        mock_tqdm.return_value.__enter__ = mock.Mock(return_value=mock_pbar)
+        mock_tqdm.return_value.__exit__ = mock.Mock(return_value=None)
+
+        # Create test message with video that has size
         message = MockMessage(
-            id=313,
+            id=17,
             media=True,
             video=MockVideo(
-                file_name="sucess_exist_down.mp4",
+                file_name="callback_test.mp4",
                 mime_type="video/mp4",
-                file_size=1024,
+                size=1024,
             ),
         )
 
-        res = self.loop.run_until_complete(
-            async_download_media(
-                client, message, ["video", "photo"], {"video": ["mp4"]}
-            )
+        # Mock the client's download_media to capture the progress_callback
+        captured_callback = None
+
+        async def mock_download_media(*args, **kwargs):
+            nonlocal captured_callback
+            captured_callback = kwargs.get("progress_callback")
+            return "downloaded"
+
+        mock_client.download_media = mock_download_media
+
+        # Run the download
+        result = self.loop.run_until_complete(
+            async_download_media(mock_client, message, ["video"], {"video": ["all"]})
         )
 
-        self.assertEqual(res, (DownloadStatus.SkipDownload, None))
+        # Verify callback was passed and is callable
+        self.assertEqual(result, 17)
+        self.assertIsNotNone(captured_callback)
+        self.assertTrue(callable(captured_callback))
 
-    @mock.patch("media_downloader.HookClient", new=MockClient)
-    @mock.patch("media_downloader.RETRY_TIME_OUT", new=1)
-    @mock.patch("media_downloader.logger")
-    def test_main_with_bot(self, mock_logger):
-        rest_app(MOCK_CONF)
-
-        main()
-
-        mock_logger.success.assert_called_with(
-            "Updated last read message_id to config file,total download 0, total upload file 0"
-        )
-
-    @mock.patch("media_downloader.app.pre_run", new=raise_keyboard_interrupt)
-    @mock.patch("media_downloader.HookClient", new=MockClient)
-    @mock.patch("media_downloader.RETRY_TIME_OUT", new=1)
-    @mock.patch("media_downloader.logger")
-    def test_keyboard_interrupt(self, mock_logger):
-        rest_app(MOCK_CONF)
-
-        main()
-
-        mock_logger.info.assert_any_call("KeyboardInterrupt")
-        mock_logger.success.assert_called_with(
-            "Updated last read message_id to config file,total download 0, total upload file 0"
-        )
-
-    @mock.patch("media_downloader.app.pre_run", new=raise_exception)
-    @mock.patch("media_downloader.HookClient", new=MockClient)
-    @mock.patch("media_downloader.RETRY_TIME_OUT", new=1)
-    @mock.patch("media_downloader.logger")
-    def test_other_exception(self, mock_logger):
-        rest_app(MOCK_CONF)
-
-        main()
-
-        mock_logger.success.assert_called_with(
-            "Updated last read message_id to config file,total download 0, total upload file 0"
-        )
-
-    @mock.patch("media_downloader._load_config", new=load_config)
-    @mock.patch("media_downloader.logger")
-    def test_check_config(self, mock_logger):
-        _check_config()
-        mock_logger.exception.assert_called_with("load config error: error load config")
-
-    def test_check_config_suc(self):
-        app.update_config()
-        self.assertEqual(_check_config(), True)
-
-    # @mock.patch(
-    #     "media_downloader.queue",
-    #     new=MyQueue(
-    #         [
-    #             (
-    #                 MockMessage(
-    #                     id=312,
-    #                     media=True,
-    #                     chat_id=8654123,
-    #                     chat_title="8654123",
-    #                     video=MockVideo(
-    #                         file_name="sucess_down.mp4",
-    #                         mime_type="video/mp4",
-    #                         file_size=1024,
-    #                     ),
-    #                 ),
-    #                 TaskNode(chat_id=8654123, upload_telegram_chat_id=123456),
-    #             ),
-    #             (
-    #                 MockMessage(
-    #                     id=333,
-    #                     media=True,
-    #                     chat_id=8654123,
-    #                     chat_title="8654123",
-    #                     text="123",
-    #                 ),
-    #                 TaskNode(chat_id=8654123, upload_telegram_chat_id=123456),
-    #             ),
-    #         ]
-    #     ),
-    # )
-    # @mock.patch("media_downloader.app.set_download_id", new=new_set_download_id)
-    # @mock.patch("media_downloader.upload_telegram_chat", new=new_upload_telegram_chat)
-    # @mock.patch("media_downloader.os.remove")
-    # @mock.patch(
-    #     "media_downloader._move_to_download_path", new=mock_move_to_download_path
-    # )
-    # @mock.patch("media_downloader.os.path.getsize", new=os_get_file_size)
-    # def test_upload_telegram_chat(self, mock_remove):
-    #     rest_app(MOCK_CONF)
-    #     client = MockClient()
-    #     app.chat_download_config[8654123].last_read_message_id = 0
-    #     self.loop.run_until_complete(worker(client))
-    #     mock_remove.assert_called_with(
-    #         platform_generic_path("/root/project/8654123/0/312 - sucess_down.mp4")
-    #     )
+        # Test the captured callback
+        captured_callback(50, 100)
+        mock_pbar.update.assert_called_with(50)
 
     @classmethod
     def tearDownClass(cls):

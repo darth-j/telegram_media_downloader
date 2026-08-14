@@ -1,37 +1,31 @@
 """Downloads media from telegram."""
+
 import asyncio
 import logging
 import os
-import shutil
-import time
+import random
+import re
+from datetime import date, datetime, timezone
 from typing import List, Optional, Tuple, Union
 
-import pyrogram
-from loguru import logger
-from pyrogram.types import Audio, Document, Photo, Video, VideoNote, Voice
 from rich.logging import RichHandler
-
-from module.app import Application, ChatDownloadConfig, DownloadStatus, TaskNode
-from module.bot import start_download_bot, stop_download_bot
-from module.download_stat import update_download_status
-from module.get_chat_history_v2 import get_chat_history_v2
-from module.language import _t
-from module.pyrogram_extension import (
-    HookClient,
-    fetch_message,
-    get_extension,
-    record_download_status,
-    report_bot_download_status,
-    set_max_concurrent_transmissions,
-    set_meta_data,
-    update_cloud_upload_stat,
-    upload_telegram_chat,
+from telethon import TelegramClient
+from telethon.errors import FileReferenceExpiredError
+from telethon.tl.types import (
+    Document,
+    Message,
+    MessageMediaDocument,
+    MessageMediaPhoto,
+    Photo,
 )
-from module.web import init_web
-from utils.format import truncate_filename, validate_title
+from tqdm import tqdm
+
+import config_manager
+import db
+from utils.file_management import get_next_name, manage_duplicate_file
 from utils.log import LogFilter
-from utils.meta import print_meta
-from utils.meta_data import MetaData
+from utils.meta import APP_VERSION, DEVICE_MODEL, LANG_CODE, SYSTEM_VERSION, print_meta
+from utils.updates import check_for_updates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,80 +33,51 @@ logging.basicConfig(
     datefmt="[%X]",
     handlers=[RichHandler()],
 )
+logging.getLogger("telethon.client.downloads").addFilter(LogFilter())
+logging.getLogger("telethon.network").addFilter(LogFilter())
+logger = logging.getLogger("media_downloader")
 
-CONFIG_NAME = "config.yaml"
-DATA_FILE_NAME = "data.yaml"
-APPLICATION_NAME = "media_downloader"
-app = Application(CONFIG_NAME, DATA_FILE_NAME, APPLICATION_NAME)
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+FAILED_IDS: dict = {}
+DOWNLOADED_IDS: dict = {}
+PROCESSED_IDS: dict = {}
+CURRENT_BATCH_IDS: dict = {}
 
-queue: asyncio.Queue = asyncio.Queue()
-RETRY_TIME_OUT = 3
-
-logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
-logging.getLogger("pyrogram.client").addFilter(LogFilter())
-
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
+# Global hook for Web UI to receive progress updates
+UI_PROGRESS_HOOK = None
 
 
-def _check_download_finish(media_size: int, download_path: str, ui_file_name: str):
-    """Check download task if finish
+def update_config(config: dict):
+    """
+    Update existing configuration file.
 
     Parameters
     ----------
-    media_size: int
-        The size of the downloaded resource
-    download_path: str
-        Resource download hold path
-    ui_file_name: str
-        Really show file name
-
+    config: dict
+        Configuration to be written into config file.
     """
-    download_size = os.path.getsize(download_path)
-    if media_size == download_size:
-        logger.success(f"{_t('Successfully downloaded')} - {ui_file_name}")
+    chats_config = config.get("chats", [])
+    if chats_config:
+        for chat_conf in chats_config:
+            chat_id = chat_conf.get("chat_id")
+            if chat_id and chat_id in DOWNLOADED_IDS and chat_id in FAILED_IDS:
+                chat_conf["ids_to_retry"] = (
+                    list(
+                        set(chat_conf.get("ids_to_retry", []))
+                        - set(DOWNLOADED_IDS[chat_id])
+                    )
+                    + FAILED_IDS[chat_id]
+                )
     else:
-        logger.warning(
-            f"{_t('Media downloaded with wrong size')}: "
-            f"{download_size}, {_t('actual')}: "
-            f"{media_size}, {_t('file name')}: {ui_file_name}"
-        )
-        os.remove(download_path)
-        raise pyrogram.errors.exceptions.bad_request_400.BadRequest()
+        chat_id = config.get("chat_id")
+        if chat_id and chat_id in DOWNLOADED_IDS and chat_id in FAILED_IDS:
+            config["ids_to_retry"] = (
+                list(set(config.get("ids_to_retry", [])) - set(DOWNLOADED_IDS[chat_id]))
+                + FAILED_IDS[chat_id]
+            )
 
-
-def _move_to_download_path(temp_download_path: str, download_path: str):
-    """Move file to download path
-
-    Parameters
-    ----------
-    temp_download_path: str
-        Temporary download path
-
-    download_path: str
-        Download path
-
-    """
-
-    directory, _ = os.path.split(download_path)
-    os.makedirs(directory, exist_ok=True)
-    shutil.move(temp_download_path, download_path)
-
-
-def _check_timeout(retry: int, _: int):
-    """Check if message download timeout, then add message id into failed_ids
-
-    Parameters
-    ----------
-    retry: int
-        Retry download message times
-
-    message_id: int
-        Try to download message 's id
-
-    """
-    if retry == 2:
-        return True
-    return False
+    config_manager.save_config(config)
+    logger.info("Updated last read message_id to config file")
 
 
 def _can_download(_type: str, file_formats: dict, file_format: Optional[str]) -> bool:
@@ -159,202 +124,121 @@ def _is_exist(file_path: str) -> bool:
     return not os.path.isdir(file_path) and os.path.exists(file_path)
 
 
-# pylint: disable = R0912
+def _progress_callback(current: int, total: int, pbar: tqdm) -> None:
+    """
+    Update progress bar for file downloads.
+
+    Parameters
+    ----------
+    current: int
+        Current number of bytes downloaded.
+    total: int
+        Total number of bytes to download.
+    pbar: tqdm
+        Progress bar instance to update.
+    """
+    if pbar.total != total:
+        pbar.total = total
+        pbar.reset()
+    pbar.update(current - pbar.n)
+
+    if UI_PROGRESS_HOOK is not None:
+        UI_PROGRESS_HOOK(pbar.desc, current, total)
 
 
 async def _get_media_meta(
-    chat_id: Union[int, str],
-    message: pyrogram.types.Message,
-    media_obj: Union[Audio, Document, Photo, Video, VideoNote, Voice],
+    media_obj: Union[Document, Photo],
     _type: str,
-) -> Tuple[str, str, Optional[str]]:
+    chat_id: Union[int, str],
+    download_directory: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
     """Extract file name and file id from media object.
 
     Parameters
     ----------
-    media_obj: Union[Audio, Document, Photo, Video, VideoNote, Voice]
+    media_obj: Union[Document, Photo]
         Media object to be extracted.
     _type: str
         Type of media object.
+    chat_id: Union[int, str]
+        ID of the chat, used for folder structuring.
+    download_directory: Optional[str]
+        Custom directory path for downloads. If None, uses default structure.
 
     Returns
     -------
-    Tuple[str, str, Optional[str]]
+    Tuple[str, Optional[str]]
         file_name, file_format
     """
-    if _type in ["audio", "document", "video"]:
-        # pylint: disable = C0301
-        file_format: Optional[str] = media_obj.mime_type.split("/")[-1]  # type: ignore
-    else:
-        file_format = None
+    file_format: Optional[str] = None
+    if hasattr(media_obj, "mime_type") and media_obj.mime_type:
+        file_format = media_obj.mime_type.split("/")[-1]
+    elif _type == "photo":
+        file_format = "jpg"
 
-    file_name = None
-    temp_file_name = None
-    dirname = validate_title(f"{chat_id}")
-    if message.chat and message.chat.title:
-        dirname = validate_title(f"{message.chat.title}")
-
-    if message.date:
-        datetime_dir_name = message.date.strftime(app.date_format)
+    # Determine base directory for downloads
+    if download_directory:
+        base_dir = download_directory
     else:
-        datetime_dir_name = "0"
+        base_dir = os.path.join(THIS_DIR, str(chat_id))
 
     if _type in ["voice", "video_note"]:
-        # pylint: disable = C0209
-        file_format = media_obj.mime_type.split("/")[-1]  # type: ignore
-        file_save_path = app.get_file_save_path(_type, dirname, datetime_dir_name)
-        file_name = "{} - {}_{}.{}".format(
-            message.id,
-            _type,
-            media_obj.date.isoformat(),  # type: ignore
-            file_format,
-        )
-        file_name = validate_title(file_name)
-        temp_file_name = os.path.join(app.temp_save_path, dirname, file_name)
-
-        file_name = os.path.join(file_save_path, file_name)
+        file_name_base = f"{_type}_{media_obj.date.isoformat()}.{file_format}"
     else:
-        file_name = getattr(media_obj, "file_name", None)
-        caption = getattr(message, "caption", None)
+        file_name_base = ""
+        if hasattr(media_obj, "attributes"):
+            for attr in media_obj.attributes:
+                if hasattr(attr, "file_name"):
+                    file_name_base = attr.file_name
+                    break
+        if file_name_base == "":
+            if hasattr(media_obj, "id"):
+                file_name_base = f"{_type}_{media_obj.id}"
 
-        file_name_suffix = ".unknown"
-        if not file_name:
-            file_name_suffix = get_extension(
-                media_obj.file_id, getattr(media_obj, "mime_type", "")
-            )
-        else:
-            # file_name = file_name.split(".")[0]
-            _, file_name_without_suffix = os.path.split(os.path.normpath(file_name))
-            file_name, file_name_suffix = os.path.splitext(file_name_without_suffix)
-            if not file_name_suffix:
-                file_name_suffix = get_extension(
-                    media_obj.file_id, getattr(media_obj, "mime_type", "")
-                )
-
-        if caption:
-            caption = validate_title(caption)
-            app.set_caption_name(chat_id, message.media_group_id, caption)
-            app.set_caption_entities(
-                chat_id, message.media_group_id, message.caption_entities
-            )
-        else:
-            caption = app.get_caption_name(chat_id, message.media_group_id)
-
-        if not file_name and message.photo:
-            file_name = f"{message.photo.file_unique_id}"
-
-        gen_file_name = (
-            app.get_file_name(message.id, file_name, caption) + file_name_suffix
-        )
-
-        file_save_path = app.get_file_save_path(_type, dirname, datetime_dir_name)
-
-        temp_file_name = os.path.join(app.temp_save_path, dirname, gen_file_name)
-
-        file_name = os.path.join(file_save_path, gen_file_name)
-    return truncate_filename(file_name), truncate_filename(temp_file_name), file_format
+    # Sanitize the file name to remove invalid Windows characters
+    file_name_base = re.sub(r'[<>:"/\\|?*]', "_", file_name_base)
+    file_name = os.path.join(base_dir, _type, file_name_base)
+    return file_name, file_format
 
 
-async def add_download_task(
-    message: pyrogram.types.Message,
-    node: TaskNode,
-):
-    """Add Download task"""
-    if message.empty:
-        return False
-    node.download_status[message.id] = DownloadStatus.Downloading
-    await queue.put((message, node))
-    node.total_task += 1
-    return True
+def get_media_type(message: Message) -> Optional[str]:
+    """
+    Determine the media type from the message's media attributes.
+
+    Parameters
+    ----------
+    message: Message
+        The Telethon message object.
+
+    Returns
+    -------
+    Optional[str]
+        The media type ('photo', 'video', 'audio', 'voice', 'video_note', 'document')
+        or None.
+    """
+    if not message.media:
+        return None
+    if isinstance(message.media, MessageMediaPhoto):
+        return "photo"
+    if isinstance(message.media, MessageMediaDocument):
+        doc = message.media.document
+        for attr in doc.attributes:
+            if hasattr(attr, "voice") and isinstance(attr.voice, bool):
+                return "voice" if attr.voice else "audio"
+            if hasattr(attr, "round_message") and isinstance(attr.round_message, bool):
+                return "video_note" if attr.round_message else "video"
+        return "document"
+    return None
 
 
-async def save_msg_to_file(
-    app, chat_id: Union[int, str], message: pyrogram.types.Message
-):
-    """Write message text into file"""
-    dirname = validate_title(
-        message.chat.title if message.chat and message.chat.title else str(chat_id)
-    )
-    datetime_dir_name = message.date.strftime(app.date_format) if message.date else "0"
-
-    file_save_path = app.get_file_save_path("msg", dirname, datetime_dir_name)
-    file_name = os.path.join(
-        app.temp_save_path,
-        file_save_path,
-        f"{app.get_file_name(message.id, None, None)}.txt",
-    )
-
-    os.makedirs(os.path.dirname(file_name), exist_ok=True)
-
-    if _is_exist(file_name):
-        return DownloadStatus.SkipDownload, None
-
-    with open(file_name, "w", encoding="utf-8") as f:
-        f.write(message.text or "")
-
-    return DownloadStatus.SuccessDownload, file_name
-
-
-async def download_task(
-    client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
-):
-    """Download and Forward media"""
-
-    download_status, file_name = await download_media(
-        client, message, app.media_types, app.file_formats, node
-    )
-
-    if app.enable_download_txt and message.text and not message.media:
-        download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
-
-    if not node.bot:
-        app.set_download_id(node, message.id, download_status)
-
-    node.download_status[message.id] = download_status
-
-    file_size = os.path.getsize(file_name) if file_name else 0
-
-    await upload_telegram_chat(
-        client,
-        node.upload_user if node.upload_user else client,
-        app,
-        node,
-        message,
-        download_status,
-        file_name,
-    )
-
-    # rclone upload
-    if (
-        not node.upload_telegram_chat_id
-        and download_status is DownloadStatus.SuccessDownload
-    ):
-        ui_file_name = file_name
-        if app.hide_file_name:
-            ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
-        if await app.upload_file(
-            file_name, update_cloud_upload_stat, (node, message.id, ui_file_name)
-        ):
-            node.upload_success_count += 1
-
-    await report_bot_download_status(
-        node.bot,
-        node,
-        download_status,
-        file_size,
-    )
-
-
-# pylint: disable = R0915,R0914
-
-
-@record_download_status
-async def download_media(
-    client: pyrogram.client.Client,
-    message: pyrogram.types.Message,
+# pylint: disable=too-many-nested-blocks
+async def download_media(  # pylint: disable=too-many-locals,too-many-branches,too-many-positional-arguments,too-many-statements
+    client: TelegramClient,
+    message: Message,
     media_types: List[str],
     file_formats: dict,
-    node: TaskNode,
+    chat_id: Union[int, str],
+    download_directory: Optional[str] = None,
 ):
     """
     Download media from Telegram.
@@ -364,341 +248,544 @@ async def download_media(
 
     Parameters
     ----------
-    client: pyrogram.client.Client
+    client: TelegramClient
         Client to interact with Telegram APIs.
-    message: pyrogram.types.Message
+    message: Message
         Message object retrieved from telegram.
     media_types: list
         List of strings of media types to be downloaded.
-        Ex : `["audio", "photo"]`
-        Supported formats:
-            * audio
-            * document
-            * photo
-            * video
-            * voice
+        Ex : ["audio", "photo"]
     file_formats: dict
         Dictionary containing the list of file_formats
-        to be downloaded for `audio`, `document` & `video`
-        media types.
+        to be downloaded.
+    chat_id: Union[int, str]
+        ID of the chat being processed.
+    download_directory: Optional[str]
+        Custom directory path for downloads. If None, uses default structure.
 
     Returns
     -------
     int
         Current message id.
     """
-
-    # pylint: disable = R0912
-
-    file_name: str = ""
-    ui_file_name: str = ""
-    task_start_time: float = time.time()
-    media_size = 0
-    _media = None
-    message = await fetch_message(client, message)
-    try:
-        for _type in media_types:
-            _media = getattr(message, _type, None)
-            if _media is None:
-                continue
-            file_name, temp_file_name, file_format = await _get_media_meta(
-                node.chat_id, message, _media, _type
-            )
-            media_size = getattr(_media, "file_size", 0)
-
-            ui_file_name = file_name
-            if app.hide_file_name:
-                ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
-
-            if _can_download(_type, file_formats, file_format):
-                if _is_exist(file_name):
-                    file_size = os.path.getsize(file_name)
-                    if file_size or file_size == media_size:
-                        logger.info(
-                            f"id={message.id} {ui_file_name} "
-                            f"{_t('already download,download skipped')}.\n"
-                        )
-
-                        return DownloadStatus.SkipDownload, None
-            else:
-                return DownloadStatus.SkipDownload, None
-
-            break
-    except Exception as e:
-        logger.error(
-            f"Message[{message.id}]: "
-            f"{_t('could not be downloaded due to following exception')}:\n[{e}].",
-            exc_info=True,
-        )
-        return DownloadStatus.FailedDownload, None
-    if _media is None:
-        return DownloadStatus.SkipDownload, None
-
-    message_id = message.id
-
     for retry in range(3):
+        if chat_id not in FAILED_IDS:
+            FAILED_IDS[chat_id] = []
+        if chat_id not in DOWNLOADED_IDS:
+            DOWNLOADED_IDS[chat_id] = []
+        if chat_id not in PROCESSED_IDS:
+            PROCESSED_IDS[chat_id] = []
         try:
-            temp_download_path = await client.download_media(
-                message,
-                file_name=temp_file_name,
-                progress=update_download_status,
-                progress_args=(
-                    message_id,
-                    ui_file_name,
-                    task_start_time,
-                    node,
-                    client,
-                ),
+            _type = get_media_type(message)
+            logger.debug("Processing message %s of type %s", message.id, _type)
+            if not _type or _type not in media_types:
+                PROCESSED_IDS[chat_id].append(message.id)
+                return message.id
+            media_obj = message.photo if _type == "photo" else message.document
+            if not media_obj:
+                PROCESSED_IDS[chat_id].append(message.id)
+                return message.id
+            file_name, file_format = await _get_media_meta(
+                media_obj, _type, chat_id, download_directory
             )
+            if _can_download(_type, file_formats, file_format):
+                file_size = getattr(media_obj, "size", 0)
+                display_name = getattr(
+                    media_obj, "file_name", os.path.basename(file_name)
+                )
+                desc = f"Downloading {display_name}"
+                logger.info(desc)
 
-            if temp_download_path and isinstance(temp_download_path, str):
-                _check_download_finish(media_size, temp_download_path, ui_file_name)
-                await asyncio.sleep(0.5)
-                _move_to_download_path(temp_download_path, file_name)
-                # TODO: if not exist file size or media
-                return DownloadStatus.SuccessDownload, file_name
-        except pyrogram.errors.exceptions.bad_request_400.BadRequest:
+                if _is_exist(file_name):
+                    file_name = get_next_name(file_name)
+                    with tqdm(
+                        total=file_size, unit="B", unit_scale=True, desc=desc
+                    ) as pbar:
+                        download_path = await client.download_media(
+                            message,
+                            file=file_name,
+                            progress_callback=lambda c, t, pbar=pbar: _progress_callback(
+                                c, t, pbar
+                            ),
+                        )
+                        download_path = manage_duplicate_file(
+                            download_path
+                        )  # type: ignore
+                else:
+                    with tqdm(
+                        total=file_size, unit="B", unit_scale=True, desc=desc
+                    ) as pbar:
+                        download_path = await client.download_media(
+                            message,
+                            file=file_name,
+                            progress_callback=lambda c, t, pbar=pbar: _progress_callback(
+                                c, t, pbar
+                            ),
+                        )
+                if download_path:
+                    logger.info("Media downloaded - %s", download_path)
+                    logger.debug("Successfully downloaded message %s", message.id)
+                    abs_path = os.path.abspath(download_path)
+                    actual_size = (
+                        os.path.getsize(abs_path)
+                        if os.path.exists(abs_path)
+                        else file_size
+                    )
+                    actual_name = os.path.basename(abs_path)
+                    db.record_download(
+                        str(chat_id),
+                        message.id,
+                        actual_name,
+                        actual_size,
+                        abs_path,
+                        _type,
+                    )
+                    if UI_PROGRESS_HOOK is not None:
+                        # Optional signature expansion for UI logic
+                        try:
+                            UI_PROGRESS_HOOK(
+                                desc,
+                                actual_size,
+                                actual_size,
+                                file_path=abs_path,
+                                media_type=_type,
+                            )
+                        except TypeError:
+                            pass
+                DOWNLOADED_IDS[chat_id].append(message.id)
+
+            PROCESSED_IDS[chat_id].append(message.id)
+            break
+        except FileReferenceExpiredError:
             logger.warning(
-                f"Message[{message.id}]: {_t('file reference expired, refetching')}..."
+                "Message[%d]: file reference expired, refetching...", message.id
             )
-            await asyncio.sleep(RETRY_TIME_OUT)
-            message = await fetch_message(client, message)
-            if _check_timeout(retry, message.id):
-                # pylint: disable = C0301
+            messages = await client.get_messages(message.chat.id, ids=message.id)
+            message = messages[0] if messages else message
+            if retry == 2:
                 logger.error(
-                    f"Message[{message.id}]: "
-                    f"{_t('file reference expired for 3 retries, download skipped.')}"
+                    "Message[%d]: file reference expired, skipping download.",
+                    message.id,
                 )
-        except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
-            await asyncio.sleep(wait_err.value)
-            logger.warning("Message[{}]: FlowWait {}", message.id, wait_err.value)
-            _check_timeout(retry, message.id)
-        except TypeError:
-            # pylint: disable = C0301
+                FAILED_IDS[chat_id].append(message.id)
+        except TimeoutError:
             logger.warning(
-                f"{_t('Timeout Error occurred when downloading Message')}[{message.id}], "
-                f"{_t('retrying after')} {RETRY_TIME_OUT} {_t('seconds')}"
+                "Timeout Error occurred when downloading Message[%d], "
+                "retrying after 5 seconds",
+                message.id,
             )
-            await asyncio.sleep(RETRY_TIME_OUT)
-            if _check_timeout(retry, message.id):
+            await asyncio.sleep(5)
+            if retry == 2:
                 logger.error(
-                    f"Message[{message.id}]: {_t('Timing out after 3 reties, download skipped.')}"
+                    "Message[%d]: Timing out after 3 retries, download skipped.",
+                    message.id,
                 )
+                FAILED_IDS[chat_id].append(message.id)
         except Exception as e:
-            # pylint: disable = C0301
             logger.error(
-                f"Message[{message.id}]: "
-                f"{_t('could not be downloaded due to following exception')}:\n[{e}].",
+                "Message[%d]: could not be downloaded due to following "
+                "exception:\n[%s].",
+                message.id,
+                e,
                 exc_info=True,
             )
+            FAILED_IDS[chat_id].append(message.id)
             break
-
-    return DownloadStatus.FailedDownload, None
-
-
-def _load_config():
-    """Load config"""
-    app.load_config()
+    return message.id
 
 
-def _check_config() -> bool:
-    """Check config"""
-    print_meta(logger)
-    try:
-        _load_config()
-        logger.add(
-            os.path.join(app.log_file_path, "tdl.log"),
-            rotation="10 MB",
-            retention="10 days",
-            level=app.log_level,
-        )
-    except Exception as e:
-        logger.exception(f"load config error: {e}")
-        return False
+async def process_messages(  # pylint: disable=too-many-positional-arguments
+    client: TelegramClient,
+    messages: List[Message],
+    media_types: List[str],
+    file_formats: dict,
+    chat_id: Union[int, str],
+    download_directory: Optional[str] = None,
+    max_concurrent_downloads: int = 4,
+    download_delay: Optional[Union[float, List[float]]] = None,
+) -> int:
+    """
+    Download media from Telegram.
 
-    return True
+    Parameters
+    ----------
+    client: TelegramClient
+        Client to interact with Telegram APIs.
+    messages: list
+        List of telegram messages.
+    media_types: list
+        List of strings of media types to be downloaded.
+    file_formats: dict
+        Dictionary containing the list of file_formats
+        to be downloaded.
+    chat_id: Union[int, str]
+        ID of the chat.
+    download_directory: Optional[str]
+        Custom directory path for downloads. If None, uses default structure.
+    max_concurrent_downloads: int
+        Max number of files to download simultaneously. 1 = fully sequential.
+        Default 4. Higher values speed up downloads but increase ban risk.
+    download_delay: Optional[Union[float, List[float]]]
+        Delay between starting each file download (seconds).
+        Pass a float for a fixed delay, or [min, max] for a random range.
+        None means no delay.
+
+    Returns
+    -------
+    int
+        Max value of list of message ids.
+    """
+    semaphore = asyncio.Semaphore(max(1, max_concurrent_downloads))
+
+    async def _download_with_limit(message: Message) -> int:
+        async with semaphore:
+            if download_delay is not None:
+                delay: Optional[float] = None
+                if isinstance(download_delay, (list, tuple)):
+                    if len(download_delay) != 2:
+                        logger.warning(
+                            "download_delay list must have exactly 2 elements "
+                            "[min, max]; got %r. Skipping delay.",
+                            download_delay,
+                        )
+                    else:
+                        try:
+                            lo, hi = float(download_delay[0]), float(download_delay[1])
+                            delay = max(0.0, random.uniform(lo, hi))
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "download_delay list %r contains non-numeric values; "
+                                "skipping delay.",
+                                download_delay,
+                            )
+                else:
+                    try:
+                        delay = max(0.0, float(download_delay))  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Invalid download_delay value %r; skipping delay.",
+                            download_delay,
+                        )
+                if delay is not None:
+                    await asyncio.sleep(delay)
+            return int(
+                await download_media(
+                    client,
+                    message,
+                    media_types,
+                    file_formats,
+                    chat_id,
+                    download_directory,
+                )
+            )
+
+    message_ids = await asyncio.gather(
+        *[_download_with_limit(message) for message in messages]
+    )
+    logger.info("Processed batch of %d messages for chat %s", len(messages), chat_id)
+    last_message_id: int = max(message_ids)
+    return last_message_id
 
 
-async def worker(client: pyrogram.client.Client):
-    """Work for download task"""
-    while app.is_running:
-        try:
-            item = await queue.get()
-            message = item[0]
-            node: TaskNode = item[1]
-
-            if node.is_stop_transmission:
-                continue
-
-            if node.client:
-                await download_task(node.client, message, node)
-            else:
-                await download_task(client, message, node)
-        except Exception as e:
-            logger.exception(f"{e}")
-
-
-async def download_chat_task(
-    client: pyrogram.Client,
-    chat_download_config: ChatDownloadConfig,
-    node: TaskNode,
+async def process_chat(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+    client: TelegramClient,
+    global_config: dict,
+    chat_conf: dict,
+    pagination_limit: int,
+    config_write_lock: asyncio.Lock,
 ):
-    """Download all task"""
-    messages_iter = get_chat_history_v2(
-        client,
-        node.chat_id,
-        limit=node.limit,
-        max_id=node.end_offset_id,
-        offset_id=chat_download_config.last_read_message_id,
-        reverse=True,
+    """
+    Process a single chat's media downloads.
+    """
+    chat_id = chat_conf["chat_id"]
+    logger.info("Starting processing for chat_id: %s", chat_id)
+
+    # Initialize state maps for this chat
+    if chat_id not in FAILED_IDS:
+        FAILED_IDS[chat_id] = []
+    if chat_id not in DOWNLOADED_IDS:
+        DOWNLOADED_IDS[chat_id] = []
+    if chat_id not in PROCESSED_IDS:
+        PROCESSED_IDS[chat_id] = []
+
+    CURRENT_BATCH_IDS[chat_id] = []
+
+    # Merge chat-specific config with global fallback
+    media_types: List[str] = chat_conf.get(
+        "media_types", global_config.get("media_types", [])
+    )
+    file_formats: dict = chat_conf.get(
+        "file_formats", global_config.get("file_formats", {})
+    )
+    last_read_message_id = chat_conf.get(
+        "last_read_message_id", global_config.get("last_read_message_id", 0)
+    )
+    _max_concurrent_raw = chat_conf.get(
+        "max_concurrent_downloads", global_config.get("max_concurrent_downloads", 4)
+    )
+    try:
+        max_concurrent_downloads = int(_max_concurrent_raw)  # type: ignore[arg-type]
+        if max_concurrent_downloads <= 0:
+            raise ValueError("must be a positive integer")
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid max_concurrent_downloads value %r; defaulting to 4.",
+            _max_concurrent_raw,
+        )
+        max_concurrent_downloads = 4
+    download_delay = chat_conf.get(
+        "download_delay", global_config.get("download_delay")
     )
 
-    chat_download_config.node = node
-
-    if chat_download_config.ids_to_retry:
-        logger.info(f"{_t('Downloading files failed during last run')}...")
-        skipped_messages: list = await client.get_messages(  # type: ignore
-            chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
+    start_date_val = chat_conf.get("start_date", global_config.get("start_date"))
+    if isinstance(start_date_val, str) and start_date_val.strip():
+        start_date = datetime.fromisoformat(start_date_val)
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+    elif isinstance(start_date_val, date):
+        start_date = datetime.combine(
+            start_date_val, datetime.min.time(), tzinfo=timezone.utc
         )
+    else:
+        start_date = None
 
+    end_date_val = chat_conf.get("end_date", global_config.get("end_date"))
+    if isinstance(end_date_val, str) and end_date_val.strip():
+        end_date = datetime.fromisoformat(end_date_val)
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+    elif isinstance(end_date_val, date):
+        end_date = datetime.combine(
+            end_date_val, datetime.min.time(), tzinfo=timezone.utc
+        )
+    else:
+        end_date = None
+
+    max_messages_val = chat_conf.get("max_messages", global_config.get("max_messages"))
+    if isinstance(max_messages_val, int):
+        max_messages = max_messages_val
+    elif isinstance(max_messages_val, str) and max_messages_val.strip():
+        max_messages = int(max_messages_val)
+    else:
+        max_messages = None
+
+    download_directory_val = chat_conf.get(
+        "download_directory", global_config.get("download_directory")
+    )
+    if isinstance(download_directory_val, str) and download_directory_val.strip():
+        download_directory = download_directory_val.strip()
+        if not os.path.isabs(download_directory):
+            download_directory = os.path.abspath(download_directory)
+        os.makedirs(download_directory, exist_ok=True)
+    else:
+        download_directory = None
+
+    messages_iter = client.iter_messages(
+        chat_id, min_id=last_read_message_id, reverse=True
+    )
+    messages_list: list = []
+    pagination_count: int = 0
+    ids_to_retry = chat_conf.get("ids_to_retry", global_config.get("ids_to_retry", []))
+
+    if ids_to_retry:
+        logger.info("Downloading files failed during last run for chat %s...", chat_id)
+        skipped_messages: list = await client.get_messages(  # type: ignore
+            chat_id, ids=ids_to_retry
+        )
         for message in skipped_messages:
-            await add_download_task(message, node)
+            pagination_count += 1
+            messages_list.append(message)
 
     async for message in messages_iter:  # type: ignore
-        meta_data = MetaData()
-
-        caption = message.caption
-        if caption:
-            caption = validate_title(caption)
-            app.set_caption_name(node.chat_id, message.media_group_id, caption)
-            app.set_caption_entities(
-                node.chat_id, message.media_group_id, message.caption_entities
-            )
-        else:
-            caption = app.get_caption_name(node.chat_id, message.media_group_id)
-        set_meta_data(meta_data, message, caption)
-
-        if app.need_skip_message(chat_download_config, message.id):
+        if end_date and message.date > end_date:
             continue
-
-        if app.exec_filter(chat_download_config, meta_data):
-            await add_download_task(message, node)
-        else:
-            node.download_status[message.id] = DownloadStatus.SkipDownload
-            if message.media_group_id:
-                await upload_telegram_chat(
-                    client,
-                    node.upload_user,
-                    app,
-                    node,
-                    message,
-                    DownloadStatus.SkipDownload,
-                )
-
-    chat_download_config.need_check = True
-    chat_download_config.total_task = node.total_task
-    node.is_running = True
-
-
-async def download_all_chat(client: pyrogram.Client):
-    """Download All chat"""
-    for key, value in app.chat_download_config.items():
-        value.node = TaskNode(chat_id=key)
-        try:
-            await download_chat_task(client, value, value.node)
-        except Exception as e:
-            logger.warning(f"Download {key} error: {e}")
-        finally:
-            value.need_check = True
-
-
-async def run_until_all_task_finish():
-    """Normal download"""
-    while True:
-        finish: bool = True
-        for _, value in app.chat_download_config.items():
-            if not value.need_check or value.total_task != value.finish_task:
-                finish = False
-
-        if (not app.bot_token and finish) or app.restart_program:
+        if start_date and message.date < start_date:
             break
+        if pagination_count != pagination_limit:
+            pagination_count += 1
+            messages_list.append(message)
+        else:
+            CURRENT_BATCH_IDS[chat_id] = [m.id for m in messages_list]
+            last_read_message_id = await process_messages(
+                client,
+                messages_list,
+                media_types,
+                file_formats,
+                chat_id,
+                download_directory,
+                max_concurrent_downloads,
+                download_delay,
+            )
+            # Memory cleanup for next batch
+            CURRENT_BATCH_IDS[chat_id] = []
+            PROCESSED_IDS[chat_id] = []
 
-        await asyncio.sleep(1)
+            if max_messages and len(DOWNLOADED_IDS[chat_id]) >= max_messages:
+                break
+            pagination_count = 0
+            messages_list = []
+            messages_list.append(message)
+            chat_conf["last_read_message_id"] = last_read_message_id
+
+            # Checkpoint: persist progress to disk after every batch so that
+            # crashes or network failures don't lose progress.
+            async with config_write_lock:
+                update_config(global_config)
+
+    if messages_list:
+        CURRENT_BATCH_IDS[chat_id] = [m.id for m in messages_list]
+        last_read_message_id = await process_messages(
+            client,
+            messages_list,
+            media_types,
+            file_formats,
+            chat_id,
+            download_directory,
+            max_concurrent_downloads,
+            download_delay,
+        )
+        CURRENT_BATCH_IDS[chat_id] = []
+        PROCESSED_IDS[chat_id] = []
+
+    chat_conf["last_read_message_id"] = last_read_message_id
+    # Final checkpoint for this chat
+    async with config_write_lock:
+        update_config(global_config)
 
 
-def _exec_loop():
-    """Exec loop"""
-
-    app.loop.run_until_complete(run_until_all_task_finish())
-
-
-async def start_server(client: pyrogram.Client):
+async def begin_import(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+    config: dict, pagination_limit: int
+) -> dict:
     """
-    Start the server using the provided client.
+    Create telethon client and initiate download.
+
+    Parameters
+    ----------
+    config: dict
+        Dict containing the config to create telethon client.
+    pagination_limit: int
+        Number of message to download asynchronously as a batch.
+
+    Returns
+    -------
+    dict
+        Updated configuration to be written into config file.
     """
+    proxy = config.get("proxy")
+    proxy_dict = None
+    if proxy:
+        proxy_dict = {
+            "proxy_type": proxy["scheme"],
+            "addr": proxy["hostname"],
+            "port": proxy["port"],
+            "username": proxy.get("username"),
+            "password": proxy.get("password"),
+        }
+    session_path = os.environ.get(
+        "TELEGRAM_SESSION", os.path.join(THIS_DIR, "sessions", "media_downloader")
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(session_path)), exist_ok=True)
+    client = TelegramClient(
+        session_path,
+        api_id=config["api_id"],
+        api_hash=config["api_hash"],
+        proxy=proxy_dict,
+        device_model=DEVICE_MODEL,
+        system_version=SYSTEM_VERSION,
+        app_version=APP_VERSION,
+        lang_code=LANG_CODE,
+    )
     await client.start()
 
+    # Extract chats format configuration
+    chats_config = config.get("chats", [])
+    if not chats_config:
+        # Backward compatibility for legacy config format
+        logger.info("Using legacy single-chat configuration format.")
+        if "chat_id" not in config:
+            raise KeyError(
+                "chat_id must be specified either in a chats list or globally."
+            )
 
-async def stop_server(client: pyrogram.Client):
-    """
-    Stop the server using the provided client.
-    """
-    await client.stop()
+        # In legacy mode, processing directly on the global config might be safer, but
+        # using the process_chat flow is strictly better for logic reuse.
+        chats_to_process = [config]
+    else:
+        chats_to_process = chats_config
+
+    parallel_chats = config.get("parallel_chats", False)
+    config_write_lock = asyncio.Lock()
+
+    if parallel_chats:
+        logger.info("Processing chats in parallel...")
+        tasks = [
+            process_chat(client, config, chat_conf, pagination_limit, config_write_lock)
+            for chat_conf in chats_to_process
+        ]
+        await asyncio.gather(*tasks)
+    else:
+        logger.info("Processing chats sequentially...")
+        for chat_conf in chats_to_process:
+            await process_chat(
+                client, config, chat_conf, pagination_limit, config_write_lock
+            )
+
+    await client.disconnect()
+    return config
 
 
 def main():
     """Main function of the downloader."""
-    tasks = []
-    client = HookClient(
-        "media_downloader",
-        api_id=app.api_id,
-        api_hash=app.api_hash,
-        proxy=app.proxy,
-        workdir=app.session_file_path,
-        start_timeout=app.start_timeout,
-    )
+    config = config_manager.load_config()
+
+    updated_config = config
     try:
-        app.pre_run()
-        init_web(app)
-
-        set_max_concurrent_transmissions(client, app.max_concurrent_transmissions)
-
-        app.loop.run_until_complete(start_server(client))
-        logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
-
-        app.loop.create_task(download_all_chat(client))
-        for _ in range(app.max_download_task):
-            task = app.loop.create_task(worker(client))
-            tasks.append(task)
-
-        if app.bot_token:
-            app.loop.run_until_complete(
-                start_download_bot(app, client, add_download_task, download_chat_task)
-            )
-        _exec_loop()
-    except KeyboardInterrupt:
-        logger.info(_t("KeyboardInterrupt"))
-    except Exception as e:
-        logger.exception("{}", e)
-    finally:
-        app.is_running = False
-        if app.bot_token:
-            app.loop.run_until_complete(stop_download_bot())
-        app.loop.run_until_complete(stop_server(client))
-        for task in tasks:
-            task.cancel()
-        logger.info(_t("Stopped!"))
-        # check_for_updates(app.proxy)
-        logger.info(f"{_t('update config')}......")
-        app.update_config()
-        logger.success(
-            f"{_t('Updated last read message_id to config file')},"
-            f"{_t('total download')} {app.total_download_task}, "
-            f"{_t('total upload file')} "
-            f"{app.cloud_drive_config.total_upload_success_file_count}"
+        updated_config = asyncio.get_event_loop().run_until_complete(
+            begin_import(config, pagination_limit=100)
         )
+    except KeyboardInterrupt:
+        logger.warning(
+            "KeyboardInterrupt received. Gentle exit triggered! "
+            "Saving the last read message IDs and exiting..."
+        )
+
+        # Accurately calculate the safe resumption point for each chat
+        chats_config = updated_config.get("chats", [])
+        if not chats_config:
+            chats_to_process = [updated_config]
+        else:
+            chats_to_process = chats_config
+
+        for chat_conf in chats_to_process:
+            chat_id = chat_conf.get("chat_id")
+            if chat_id and chat_id in CURRENT_BATCH_IDS:
+                batch_ids = CURRENT_BATCH_IDS[chat_id]
+                processed = PROCESSED_IDS.get(chat_id, [])
+                unprocessed = [m_id for m_id in batch_ids if m_id not in processed]
+                if unprocessed:
+                    # Safe ID is just below the lowest unprocessed message.
+                    # IDs between this boundary and min(unprocessed) that were
+                    # already processed will be re-encountered on next run, but
+                    # the file-existence check prevents actual re-downloads.
+                    safe_id = min(unprocessed) - 1
+                    chat_conf["last_read_message_id"] = max(0, safe_id)
+                elif batch_ids:
+                    # All messages in batch were processed: resume after the
+                    # highest message so the next run starts beyond this batch.
+                    chat_conf["last_read_message_id"] = max(batch_ids)
+
+    total_failures = sum(len(set(fail_list)) for fail_list in FAILED_IDS.values())
+    if total_failures > 0:
+        logger.info(
+            "Downloading of %d files failed. "
+            "Failed message ids are added to config file.\n"
+            "These files will be downloaded on the next run.",
+            total_failures,
+        )
+    update_config(updated_config)
+    check_for_updates()
 
 
 if __name__ == "__main__":
-    if _check_config():
-        main()
+    print_meta(logger)
+    main()

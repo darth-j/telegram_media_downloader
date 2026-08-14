@@ -1,0 +1,16 @@
+.git
+.github
+.idea
+.venv
+__pycache__
+*.py[cod]
+*.session*
+.pytest_cache
+.mypy_cache
+downloads
+sessions
+config.yaml
+downloads.sqlite3
+tests
+docs
+assets
