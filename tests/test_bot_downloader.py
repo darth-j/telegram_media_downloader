@@ -59,7 +59,12 @@ def test_progress_reporter_throttles_and_reports_completion(monkeypatch):
         await reporter(20, 100)
         await reporter(100, 100)
 
-    asyncio.run(report_progress())
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    loop.run_until_complete(report_progress())
 
     assert len(edits) == 2
     assert "10.0%" in edits[0]
