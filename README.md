@@ -1,21 +1,42 @@
 
 <h1 align="center">Telegram Media Downloader</h1>
 
+## 项目说明
+
+本项目基于 [Dineshkarthik/telegram_media_downloader](https://github.com/Dineshkarthik/telegram_media_downloader) 原始项目，融合 [tangyoha/telegram_media_downloader](https://github.com/tangyoha/telegram_media_downloader) 的 Docker 化部署与 Telegram Bot 使用方式，并持续适配、更新到最新版本。
+
+### 核心功能
+
+- 向 Telegram Bot 直接发送或转发媒体，自动下载文件。
+- 发送 Telegram 消息链接自动解析下载，支持公开频道以及登录用户已加入的私有频道。
+- 提供 tangyoha 风格的任务卡，实时显示文件名、大小、速度、进度和下载结果。
+- 提供 Web UI、下载任务历史和媒体预览。
+- 持久化保存 Telegram API 配置、代理、用户会话、下载进度和下载文件，升级容器无需重复配置。
+- 支持 Docker Compose 部署，以及 `linux/amd64`、`linux/arm64` 多架构镜像。
+- 通过 GitHub Actions 自动测试、构建镜像并推送至 [Docker Hub](https://hub.docker.com/r/sky97/telegram_media_downloader_containe)。
+
+### 运行方式
+
+- **Telegram Bot**：向已配置的 Bot 发送或转发媒体/消息链接，即可自动创建下载任务。
+- **Web UI**：通过浏览器完成配置、启动批量下载、查看任务历史和媒体文件。
+- **Docker Compose**：推荐的部署方式，详细步骤见 [Docker 中文部署与旧版迁移指南](DOCKER_DEPLOY_CN.md)。
+- **GitHub Actions**：推送到 `master` 分支或手动触发工作流后，自动构建并发布 Docker Hub 的 `latest` 与提交 SHA 标签。
+
+---
+
 <p align="center">
-<a href="https://github.com/Dineshkarthik/telegram_media_downloader/actions"><img alt="Unittest" src="https://github.com/Dineshkarthik/telegram_media_downloader/workflows/Unittest/badge.svg"></a>
-<a href="https://codecov.io/gh/Dineshkarthik/telegram_media_downloader"><img alt="Coverage Status" src="https://codecov.io/gh/Dineshkarthik/telegram_media_downloader/branch/master/graph/badge.svg"></a>
-<a href="https://github.com/Dineshkarthik/telegram_media_downloader/blob/master/LICENSE"><img alt="License: MIT" src="https://black.readthedocs.io/en/stable/_static/license.svg"></a>
+<a href="https://github.com/darth-j/telegram_media_downloader/actions/workflows/unittest.yml"><img alt="Unittest" src="https://github.com/darth-j/telegram_media_downloader/actions/workflows/unittest.yml/badge.svg"></a>
+<a href="https://github.com/darth-j/telegram_media_downloader/actions/workflows/docker-publish.yml"><img alt="Docker" src="https://github.com/darth-j/telegram_media_downloader/actions/workflows/docker-publish.yml/badge.svg"></a>
+<a href="https://github.com/darth-j/telegram_media_downloader/blob/master/LICENSE"><img alt="License: MIT" src="https://black.readthedocs.io/en/stable/_static/license.svg"></a>
 <a href="https://github.com/python/black"><img alt="Code style: black" src="https://img.shields.io/badge/code%20style-black-000000.svg"></a>
 </p>
 
 <h3 align="center">
-  <a href="https://github.com/Dineshkarthik/telegram_media_downloader/discussions/categories/ideas">Feature request</a>
+  <a href="https://github.com/darth-j/telegram_media_downloader/issues">Feature request</a>
   <span> · </span>
-  <a href="https://github.com/Dineshkarthik/telegram_media_downloader/issues">Report a bug</a>
+  <a href="https://github.com/darth-j/telegram_media_downloader/issues">Report a bug</a>
   <span> · </span>
-  Support: <a href="https://github.com/Dineshkarthik/telegram_media_downloader/discussions">Discussions</a>
-  <span> & </span>
-  <a href="https://t.me/tgmdnews">Telegram Community</a>
+  <a href="https://hub.docker.com/r/sky97/telegram_media_downloader_containe">Docker Hub</a>
 </h3>
 
 ### Overview:
